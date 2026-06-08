@@ -1310,49 +1310,133 @@ def pack_sales(df, profile):
 
 
 def pack_inventory(df, profile):
-    """Best-in-class Inventory engine — stock value, reorder, expiry, dead stock,
-    ABC concentration, and segment breakdowns."""
+    """Best-in-class Inventory engine — stock value, reorder, days-of-cover,
+    revenue-at-risk, overstock, turnover, margin/GMROI, movers, supplier spend,
+    ABC concentration, dead stock and expiry."""
     K, S, A = {}, {}, []
-    stock  = _col(profile, "balance", "stock", "on hand", "qty", "quantity", "units in stock", role="number")
-    value  = _col(profile, "stock value", "total cost", "inventory value", "value", "amount", role="number")
-    ucost  = _col(profile, "unit cost", "cost/piece", "cost per", "unit price", "cost", "rate", role="number")
-    reorder= _col(profile, "reorder", "min level", "min stock", "reorder point", "safety stock", role="number")
-    name   = _col(profile, "item name", "product", "item", "description", "name", "sku")
-    cat    = _col(profile, "category", "type", "group")
-    wh     = _col(profile, "warehouse", "location", "store", "godown", "branch")
-    brand  = _col(profile, "brand", "make", "manufacturer", "supplier")
-    expiry = _col(profile, "expiry", "expiration", "exp date", "best before", role="date")
-    moved  = _col(profile, "sold", "issued", "dispatched", "movement", "consumed", "units sold", role="number")
+    stock   = _col(profile, "current stock", "balance", "stock", "on hand", "units in stock", "qty", "quantity", role="number")
+    value   = _col(profile, "stock value", "inventory value", "total cost", role="number")
+    ucost   = _col(profile, "unit cost", "cost per", "cost/piece", "purchase cost", role="number")
+    sell    = _col(profile, "selling price", "sale price", "retail price", "mrp", "list price", role="number")
+    reorder = _col(profile, "reorder", "min level", "min stock", "reorder point", "safety stock", role="number")
+    maxs    = _col(profile, "max stock", "maximum stock", "max level", role="number")
+    demand  = _col(profile, "monthly demand", "demand", "avg demand", "forecast demand", "monthly sales", role="number")
+    sold30  = _col(profile, "sold last 30", "units sold last 30", "last 30 days", "30 day", role="number")
+    sold90  = _col(profile, "sold last 90", "units sold last 90", "last 90 days", "90 day", role="number")
+    lastsold= _col(profile, "last sold", "days since", "last movement", role="number")
+    name    = _col(profile, "item name", "product", "item", "description", "name", "sku")
+    cat     = _col(profile, "category", "type", "group")
+    wh      = _col(profile, "warehouse", "location", "store", "godown", "branch")
+    supplier= _col(profile, "supplier", "vendor")
+    brand   = _col(profile, "brand", "make", "manufacturer")
+    expiry  = _col(profile, "expiry", "expiration", "exp date", "best before", role="date")
 
     K["Total SKUs"] = len(df)
+    s  = _numv(df, stock) if stock else None
+    uc = _numv(df, ucost) if ucost else None
+    sp = _numv(df, sell)  if sell  else None
 
     # stock value: prefer a value column, else stock × unit cost
     val = None
-    if value is not None:   val = _numv(df, value)
-    elif ucost is not None and stock is not None: val = _numv(df, stock) * _numv(df, ucost)
+    if value is not None:                       val = _numv(df, value)
+    elif uc is not None and s is not None:      val = s * uc
     if val is not None:
         _money_kpi(K, "Stock Value", float(val.sum()))
 
-    if stock is not None:
-        s = _numv(df, stock)
+    if s is not None:
         K["Units in Stock"] = int(round(float(s.fillna(0).sum())))
         oos = int((s <= 0).sum()); low = int(((s > 0) & (s <= 5)).sum())
         K["Out of Stock"] = oos
-        if low: K["Low Stock (≤5)"] = low
-        if oos: A.append({"type": "Critical", "text": f"{oos} item(s) out of stock."})
         if reorder is not None:
             rl = _numv(df, reorder)
             need = int(((s.notna()) & (rl.notna()) & (s < rl)).sum())
             if need:
                 K["Reorder Needed"] = need
                 A.append({"type": "Warning", "text": f"{need} item(s) below reorder level — restock."})
+        if oos: A.append({"type": "Critical", "text": f"{oos} item(s) out of stock."})
+        if low: K["Low Stock (≤5)"] = low
+
+    # ── Revenue at risk — out-of-stock items × demand × price (the cost of stockouts) ──
+    if s is not None and demand and sp is not None:
+        dm = _numv(df, demand); oosm = (s <= 0)
+        atrisk = float((dm[oosm].fillna(0) * sp[oosm].fillna(0)).sum())
+        if atrisk > 0:
+            _money_kpi(K, "Revenue at Risk", atrisk)
+            A.append({"type": "Critical", "text": f"{_fmt(atrisk)}/mo of sales at risk from out-of-stock items."})
+
+    # ── Days of cover — how long until each item runs out at current demand ──
+    if s is not None and demand:
+        daily = (_numv(df, demand) / 30.0)
+        cover = s / daily.replace(0, np.nan)
+        valid = cover.replace([np.inf, -np.inf], np.nan).dropna()
+        if len(valid):
+            K["Avg Days of Cover"] = int(round(float(valid.mean())))
+            soon = int((valid <= 14).sum())
+            if soon: A.append({"type": "Warning", "text": f"{soon} item(s) will run out within 2 weeks at current demand."})
+            if name is not None:
+                try:
+                    cd = pd.DataFrame({"name": df[name].astype(str), "days": cover})
+                    cd = cd[(cd["days"].notna()) & np.isfinite(cd["days"]) & (cd["days"] > 0)].sort_values("days").head(8)
+                    if len(cd): S["Running out soonest (days of cover)"] = [{"name": r["name"], "days": int(r["days"])} for _, r in cd.iterrows()]
+                except Exception:
+                    pass
+
+    # ── Margin & potential profit (needs selling price + unit cost) ──
+    if sp is not None and uc is not None:
+        mp = (sp - uc) / sp.replace(0, np.nan)
+        if mp.notna().any():
+            K["Avg Margin %"] = round(float(mp.dropna().mean()) * 100, 1)
+        if s is not None:
+            pot = float(((sp - uc) * s).clip(lower=0).sum())
+            if pot > 0: _money_kpi(K, "Potential Profit", pot)
+
+    # ── Overstock / excess capital (stock above max level) ──
+    if s is not None and maxs:
+        mx = _numv(df, maxs)
+        over = (s.notna()) & (mx.notna()) & (s > mx)
+        nover = int(over.sum())
+        if nover:
+            K["Overstock Items"] = nover
+            if uc is not None:
+                excess = float(((s - mx)[over] * uc[over]).clip(lower=0).sum())
+                if excess > 0:
+                    _money_kpi(K, "Excess Capital", excess)
+                    A.append({"type": "Warning", "text": f"{nover} overstocked item(s) — {_fmt(excess)} tied up in excess inventory."})
+            else:
+                A.append({"type": "Warning", "text": f"{nover} item(s) above max stock level."})
+
+    # ── Turnover + fast/slow movers (needs a units-sold column) ──
+    movecol = sold90 or sold30
+    if movecol and name is not None:
+        mv = _numv(df, movecol).fillna(0)
+        if s is not None:
+            tot_units = float(s.fillna(0).sum()) or 1.0
+            K["Stock Turnover"] = round(float(mv.sum()) / tot_units, 2)
+        try:
+            g = mv.groupby(df[name].astype(str)).sum()
+            g = g[~g.index.str.lower().isin(["nan", "none", ""])].sort_values(ascending=False)
+            tot = float(g.sum()) or 1.0
+            S["Fastest movers (units sold)"] = [{"name": str(k), "units": int(v), "pct": round(v/tot*100, 1)} for k, v in g.head(8).items()]
+            slow = g[g > 0].sort_values().head(5) if (g > 0).any() else g.sort_values().head(5)
+            S["Slowest movers (units sold)"] = [{"name": str(k), "units": int(v), "pct": round(v/tot*100, 1)} for k, v in slow.items()]
+        except Exception:
+            pass
+
+    # ── Dead stock — no recent sales (prefer 90-day units, else days-since-sold) ──
+    dead = None
+    if sold90:    dead = int((_numv(df, sold90).fillna(0) <= 0).sum())
+    elif lastsold: dead = int((_numv(df, lastsold) > 90).sum())
+    if dead:
+        K["Dead Stock"] = dead
+        A.append({"type": "Warning", "text": f"{dead} item(s) with no recent sales — dead stock tying up cash."})
 
     # ── Segment breakdowns by value ──
     if val is not None:
-        if name is not None:  S["Top items by value"] = _sumrows(df, name, val, 10)
-        if cat is not None:   S["Stock value by category"] = _sumrows(df, cat, val, 10)
-        if wh is not None:    S["Stock value by warehouse"] = _sumrows(df, wh, val, 8)
-        if brand is not None: S["Stock value by brand"] = _sumrows(df, brand, val, 8)
+        if name is not None:     S["Top items by value"] = _sumrows(df, name, val, 10)
+        if cat is not None:      S["Stock value by category"] = _sumrows(df, cat, val, 10)
+        if wh is not None:       S["Stock value by warehouse"] = _sumrows(df, wh, val, 8)
+        if supplier is not None: S["Stock value by supplier"] = _sumrows(df, supplier, val, 8)
+        elif brand is not None:  S["Stock value by brand"] = _sumrows(df, brand, val, 8)
 
         # ── ABC analysis (value concentration) ──
         if name is not None:
@@ -1370,14 +1454,6 @@ def pack_inventory(df, profile):
                 if a: A.append({"type": "Opportunity", "text": f"{a} 'A' items ({round(a/len(g)*100)}% of SKUs) hold {round(va/total*100)}% of stock value — focus here."})
             except Exception:
                 pass
-
-    # ── Dead stock (needs a movement/sold column) ──
-    if moved is not None:
-        m = _numv(df, moved).fillna(0)
-        dead = int((m <= 0).sum())
-        if dead:
-            K["Dead Stock"] = dead
-            A.append({"type": "Warning", "text": f"{dead} item(s) with no movement — dead stock tying up cash."})
 
     # ── Expiry ──
     if expiry is not None:
@@ -1794,7 +1870,10 @@ def apply_module_pack(module: str, df: pd.DataFrame, profile: list[dict], result
             rebuilt[k] = v
         result.clear(); result.update(rebuilt)
     if A:
-        result["alerts"] = A + result.get("alerts", [])
+        # drop the low-value generic "X is the largest in Y" alerts — the pack's
+        # curated sections already convey this, so they'd just be noise.
+        base_alerts = [al for al in result.get("alerts", []) if "is the largest in" not in al.get("text", "")]
+        result["alerts"] = A + base_alerts
     return pack.__name__.replace("pack_", "")
 
 
