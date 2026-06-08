@@ -2099,6 +2099,7 @@ async def analyze(
     group_by: str = Form(default=""),    # optional: column to break a measure down by
     measure: str = Form(default=""),     # optional: numeric column to measure
     edits: str = Form(default=""),       # JSON: [{"row":int,"col":str,"value":any}] manual corrections
+    clean_options: str = Form(default=""),  # JSON: {"blanks": "leave"|"zero"|"mean"|"median"|"drop_rows"}
 ):
     # Validate file type
     name = file.filename.lower() if file.filename else ""
@@ -2136,6 +2137,45 @@ async def analyze(
                 pass
     if applied_edits:
         fixes.insert(0, f"{applied_edits} manual correction{'s' if applied_edits != 1 else ''} applied before analysis")
+
+    # ── Cleaning with approval: the client decides how to handle blank cells ──
+    # raw_blanks is measured BEFORE we act, so the UI can always offer the choice.
+    raw_blanks = int(df.isna().sum().sum())
+    try:
+        copts = json.loads(clean_options) if clean_options else {}
+        if not isinstance(copts, dict):
+            copts = {}
+    except Exception:
+        copts = {}
+    blanks_mode = copts.get("blanks", "leave")
+    if raw_blanks and blanks_mode != "leave":
+        if blanks_mode == "drop_rows":
+            before = len(df)
+            df = df.dropna().reset_index(drop=True)
+            dropped = before - len(df)
+            if dropped:
+                fixes.insert(0, f"Removed {dropped} row(s) containing blanks (your choice)")
+        else:
+            num_cols = df.select_dtypes(include=[np.number]).columns
+            filled = 0
+            for c in num_cols:
+                na = int(df[c].isna().sum())
+                if not na:
+                    continue
+                if blanks_mode == "zero":
+                    fillv = 0.0
+                elif blanks_mode == "mean":
+                    fillv = float(df[c].mean()) if df[c].notna().any() else 0.0
+                elif blanks_mode == "median":
+                    fillv = float(df[c].median()) if df[c].notna().any() else 0.0
+                else:
+                    fillv = None
+                if fillv is not None:
+                    df[c] = df[c].fillna(fillv)
+                    filled += na
+            if filled:
+                label = {"zero": "0", "mean": "the column average", "median": "the column median"}.get(blanks_mode, blanks_mode)
+                fixes.insert(0, f"Filled {filled} blank number(s) with {label} (your choice)")
 
     # ── Universal adaptive analysis — SAME engine for every module ──
     try:
@@ -2184,6 +2224,8 @@ async def analyze(
         "measures": measures,
         "applied_filters": flt,
         "applied_edits": applied_edits,
+        "raw_blanks": raw_blanks,
+        "blanks_mode": blanks_mode,
         "preview": preview,
         "result": result,
     }
