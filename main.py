@@ -2302,9 +2302,9 @@ async def report(
     """Full analytical report as a multi-sheet .xlsx with native Excel charts —
     mirrors exactly what the dashboard shows (same edits, cleaning, filters)."""
     from openpyxl import Workbook
-    from openpyxl.chart import BarChart, LineChart, Reference
+    from openpyxl.chart import BarChart, LineChart, DoughnutChart, Reference
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.formatting.rule import ColorScaleRule
+    from openpyxl.formatting.rule import ColorScaleRule, DataBarRule
     from openpyxl.chart.label import DataLabelList
 
     name = file.filename.lower() if file.filename else ""
@@ -2398,13 +2398,12 @@ async def report(
             n = len(rows)
             wss.column_dimensions["A"].width = 30; wss.column_dimensions["B"].width = 18
             wss.freeze_panes = "A2"
-            # heat colour scale (low=red → high=green), like the app's bars
+            # in-cell data bars on the value column (like the references' "Top drivers")
             if vk is not None and n >= 2 and not is_trend:
                 wss.conditional_formatting.add(
                     f"B2:B{n+1}",
-                    ColorScaleRule(start_type="min", start_color="F8696B",
-                                   mid_type="percentile", mid_value=50, mid_color="FFEB84",
-                                   end_type="max", end_color="63BE7B"))
+                    DataBarRule(start_type="num", start_value=0, end_type="max",
+                                color="6366F1", showValue=True))
             if vk is not None and n >= 1:
                 ch = _chart(is_trend, wss, n, title, money, w=17, h=max(8.5, n * 0.55))
                 wss.add_chart(ch, "D2")
@@ -2433,8 +2432,13 @@ async def report(
         ws.merge_cells(start_row=vr, start_column=c1, end_row=vr, end_column=c2)
         lab = ws.cell(lr, c1, k.upper()); lab.font = Font(bold=True, color=GREY, size=8)
         lab.alignment = Alignment(horizontal="left", vertical="center")
-        val = K.get(k + "_fmt"); val = K[k] if val is None else val
-        vc = ws.cell(vr, c1, val); vc.font = Font(bold=True, color=INK, size=14)
+        raw = K.get(k)
+        is_growth = any(g in k.lower() for g in ("growth", "mom", "yoy", "change")) and isinstance(raw, (int, float))
+        val = K.get(k + "_fmt"); val = (raw if val is None else val)
+        vcolor = INK
+        if is_growth:
+            val = f'{"▲" if raw >= 0 else "▼"} {abs(raw)}%'; vcolor = "059669" if raw >= 0 else "DC2626"
+        vc = ws.cell(vr, c1, val); vc.font = Font(bold=True, color=vcolor, size=14)
         vc.alignment = Alignment(horizontal="left", vertical="center")
         ws.row_dimensions[lr].height = 14; ws.row_dimensions[vr].height = 22
         for rr in (lr, vr):
@@ -2451,13 +2455,17 @@ async def report(
         c.font = Font(color=TONE.get(p.get("tone"), INK), size=10.5); r += 1
     r += 1
 
-    # Two charts on the dashboard (first trend + first breakdown), referencing section sheets
+    # Two charts on the dashboard: a trend line + a composition donut
     trend_ref = next((x for x in refs if x["is_trend"]), None)
     bd_ref = next((x for x in refs if not x["is_trend"]), None)
     if trend_ref:
         ws.add_chart(_chart(True, trend_ref["wss"], trend_ref["n"], trend_ref["title"], trend_ref["money"], w=15, h=8), f"A{r}")
     if bd_ref:
-        ws.add_chart(_chart(False, bd_ref["wss"], bd_ref["n"], bd_ref["title"], bd_ref["money"], w=15, h=8), f"E{r}")
+        dn = DoughnutChart(); dn.title = bd_ref["title"]; dn.width = 15; dn.height = 8; dn.holeSize = 55
+        dn.add_data(Reference(bd_ref["wss"], min_col=2, min_row=1, max_row=bd_ref["n"] + 1), titles_from_data=True)
+        dn.set_categories(Reference(bd_ref["wss"], min_col=1, min_row=2, max_row=bd_ref["n"] + 1))
+        dn.dataLabels = DataLabelList(); dn.dataLabels.showPercent = True
+        ws.add_chart(dn, f"E{r}")
 
     # ── Cleaned data sheet (last) ──
     wsd = wb.create_sheet(_safe_sheet_name("Data", used))
