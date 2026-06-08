@@ -2305,6 +2305,7 @@ async def report(
     from openpyxl.chart import BarChart, LineChart, Reference
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.formatting.rule import ColorScaleRule
+    from openpyxl.chart.label import DataLabelList
 
     name = file.filename.lower() if file.filename else ""
     if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json"]):
@@ -2344,6 +2345,31 @@ async def report(
     MONEY_KEYS = {"value", "revenue", "amount", "total", "sales", "profit", "cost", "spend", "payroll", "disbursed"}
     TONE = {"good": "059669", "bad": "DC2626", "neutral": INK}
 
+    def _chart(is_trend, wss, n, title, money, w, h):
+        """A native chart that SHOWS its data — category labels on the axis + the
+        value printed on every bar/point — so the numbers are readable in-chart."""
+        c = LineChart() if is_trend else BarChart()
+        if not is_trend:
+            c.type = "bar"; c.gapWidth = 60
+        c.title = title; c.legend = None; c.width = w; c.height = h
+        c.add_data(Reference(wss, min_col=2, min_row=1, max_row=n + 1), titles_from_data=True)
+        c.set_categories(Reference(wss, min_col=1, min_row=2, max_row=n + 1))
+        # print the values on the chart
+        c.dataLabels = DataLabelList()
+        c.dataLabels.showVal = True
+        c.dataLabels.numFmt = CUR_FMT if money else "#,##0"
+        c.dataLabels.showSerName = c.dataLabels.showCatName = c.dataLabels.showLegendKey = False
+        # make sure both axes (incl. the category labels) are visible
+        c.x_axis.delete = False; c.y_axis.delete = False
+        c.x_axis.majorGridlines = None
+        if not is_trend:
+            c.y_axis.majorGridlines = None
+        try:
+            c.series[0].graphicalProperties.solidFill = INDIGO
+        except Exception:
+            pass
+        return c
+
     wb = Workbook()
     used: set = set()
     K = result.get("kpis") or {}
@@ -2380,18 +2406,9 @@ async def report(
                                    mid_type="percentile", mid_value=50, mid_color="FFEB84",
                                    end_type="max", end_color="63BE7B"))
             if vk is not None and n >= 1:
-                ch = LineChart() if is_trend else BarChart()
-                if not is_trend:
-                    ch.type = "bar"
-                ch.title = title; ch.height = 8.5; ch.width = 16; ch.legend = None
-                ch.add_data(Reference(wss, min_col=2, min_row=1, max_row=n + 1), titles_from_data=True)
-                ch.set_categories(Reference(wss, min_col=1, min_row=2, max_row=n + 1))
-                try:
-                    ch.series[0].graphicalProperties.solidFill = INDIGO
-                except Exception:
-                    pass
+                ch = _chart(is_trend, wss, n, title, money, w=17, h=max(8.5, n * 0.55))
                 wss.add_chart(ch, "D2")
-                refs.append({"wss": wss, "n": n, "is_trend": is_trend})
+                refs.append({"wss": wss, "n": n, "is_trend": is_trend, "money": money, "title": title})
         except Exception:
             continue
 
@@ -2437,22 +2454,10 @@ async def report(
     # Two charts on the dashboard (first trend + first breakdown), referencing section sheets
     trend_ref = next((x for x in refs if x["is_trend"]), None)
     bd_ref = next((x for x in refs if not x["is_trend"]), None)
-    def _dash_chart(ref):
-        c = LineChart() if ref["is_trend"] else BarChart()
-        if not ref["is_trend"]:
-            c.type = "bar"
-        c.height = 7.5; c.width = 14.5; c.legend = None; c.title = ref["wss"].title
-        c.add_data(Reference(ref["wss"], min_col=2, min_row=1, max_row=ref["n"] + 1), titles_from_data=True)
-        c.set_categories(Reference(ref["wss"], min_col=1, min_row=2, max_row=ref["n"] + 1))
-        try:
-            c.series[0].graphicalProperties.solidFill = INDIGO
-        except Exception:
-            pass
-        return c
     if trend_ref:
-        ws.add_chart(_dash_chart(trend_ref), f"A{r}")
+        ws.add_chart(_chart(True, trend_ref["wss"], trend_ref["n"], trend_ref["title"], trend_ref["money"], w=15, h=8), f"A{r}")
     if bd_ref:
-        ws.add_chart(_dash_chart(bd_ref), f"E{r}")
+        ws.add_chart(_chart(False, bd_ref["wss"], bd_ref["n"], bd_ref["title"], bd_ref["money"], w=15, h=8), f"E{r}")
 
     # ── Cleaned data sheet (last) ──
     wsd = wb.create_sheet(_safe_sheet_name("Data", used))
