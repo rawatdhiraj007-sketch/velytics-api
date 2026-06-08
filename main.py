@@ -1403,24 +1403,115 @@ def pack_inventory(df, profile):
 
 
 def pack_finance(df, profile):
+    """CFO-grade finance engine: P&L (revenue / expense / net / margin), budget
+    variance, monthly cash-flow trend, expense drivers, department & vendor spend.
+    Works on any ledger / transactions / P&L sheet."""
     K, S, A = {}, {}, []
-    amt = _col(profile, "amount", "value", "total", role="number")
-    budget = _col(profile, "budget", "planned", role="number")
-    typ = _col(profile, "type", "category", "head", "account")
-    if amt:
-        a = _numv(df, amt); tot = float(a.sum()); _money_kpi(K, "Total Amount", tot)
-        if typ:
-            S["Amount by type"] = _sumrows(df, typ, a, 10)
-            low = df[typ].astype(str).str.lower()
-            inc = float(a[low.str.contains("income|revenue|credit|in", na=False)].sum())
-            exp = float(a[low.str.contains("expense|cost|debit|out", na=False)].sum())
-            if inc and exp:
-                _money_kpi(K, "Net", inc - exp); K["Profit Margin %"] = _pct(inc - exp, inc)
-        if budget:
-            b = float(_numv(df, budget).sum())
-            if b:
-                var = _pct(tot - b, b); K["Budget Variance %"] = var
-                if tot > b: A.append({"type": "Warning", "text": f"Over budget by {var}% (₹{round(tot-b):,})."})
+    amt    = _col(profile, "amount", "value", "total", "amt", "umsatz", "betrag", role="number")
+    budget = _col(profile, "budget", "planned", "forecast", "target", role="number")
+    typ    = _col(profile, "type", "transaction type", "txn type", "head", "account", "category", "flow")
+    dept   = _col(profile, "department", "dept", "cost center", "cost centre", "team", "division", "unit")
+    subcat = _col(profile, "sub-category", "subcategory", "sub category", "line item", "category", "head", "account")
+    vendor = _col(profile, "vendor", "supplier", "payee", "merchant", "counterparty", "paid to")
+    date   = _col(profile, "date", "month", "period", "posting date", "txn date", role="date")
+    if not amt:
+        return K, S, A
+    a = _numv(df, amt)
+    K["Transactions"] = int(a.notna().sum())
+
+    # ── classify income vs expense (by a type column, else by sign) ──
+    inc_mask = exp_mask = None
+    if typ:
+        low = df[typ].astype(str).str.lower()
+        inc_mask = low.str.contains(r"revenue|income|credit|sales|inflow|receipt|earning", na=False)
+        exp_mask = low.str.contains(r"expense|cost|debit|cogs|purchase|spend|payment|outflow|payroll|opex|capex|bill", na=False)
+    if (inc_mask is None or not (inc_mask.any() or exp_mask.any())) and (a < 0).any():
+        inc_mask, exp_mask = (a > 0), (a < 0)
+
+    income  = float(a[inc_mask].sum())       if inc_mask is not None else 0.0
+    expense = float(a[exp_mask].abs().sum())  if exp_mask is not None else 0.0
+
+    if income or expense:
+        if income:  _money_kpi(K, "Total Revenue", income)
+        if expense: _money_kpi(K, "Total Expenses", expense)
+        net = income - expense
+        _money_kpi(K, "Net Profit", net)
+        if income:
+            K["Profit Margin %"] = _pct(net, income)
+            K["Expense Ratio %"] = _pct(expense, income)
+        S["Income vs expense"] = [
+            {"name": "Revenue",  "value": round(income, 2),  "pct": _pct(income, income + expense)},
+            {"name": "Expenses", "value": round(expense, 2), "pct": _pct(expense, income + expense)}]
+        if net < 0:
+            A.append({"type": "Critical", "text": f"Operating at a loss of {_fmt(abs(net))} — expenses exceed revenue."})
+        elif income and _pct(net, income) < 10:
+            A.append({"type": "Warning", "text": f"Profit margin is {_pct(net, income)}% — thin; watch costs."})
+        elif income and _pct(net, income) >= 25:
+            A.append({"type": "Opportunity", "text": f"Healthy {_pct(net, income)}% profit margin."})
+    else:
+        _money_kpi(K, "Total Amount", float(a.sum()))
+
+    # ── budget variance (actual vs planned, like-for-like over all lines) ──
+    if budget:
+        b = float(_numv(df, budget).sum())
+        actual = float(a.sum())
+        if b:
+            var = _pct(actual - b, b); K["Budget Variance %"] = var
+            if dept:
+                bd = _numv(df, budget)
+                rows = []
+                for d, g in df.groupby(df[dept].astype(str)):
+                    if str(d).lower() in ("nan", "none", ""):
+                        continue
+                    diff = float(a[g.index].sum() - bd[g.index].sum())
+                    rows.append({"name": str(d), "value": round(diff, 2), "pct": 0.0})
+                rows.sort(key=lambda r: r["value"], reverse=True)
+                if rows:
+                    S["Budget variance by department"] = rows
+                    worst = rows[0]
+                    if worst["value"] > 0:
+                        A.append({"type": "Warning", "text": f"{worst['name']} is the biggest budget overrun ({_fmt(worst['value'])} over plan)."})
+
+    # ── expense drivers & revenue mix ──
+    if exp_mask is not None and exp_mask.any():
+        ea = a[exp_mask].abs(); ed = df[exp_mask]
+        if subcat: S["Top expenses (by category)"] = _sumrows(ed, subcat, ea, 8)
+        if dept:   S["Expenses by department"]     = _sumrows(ed, dept, ea, 10)
+        if vendor:
+            tv = _sumrows(ed, vendor, ea, 8)
+            if tv:
+                S["Top vendors by spend"] = tv
+                if tv[0]["pct"] >= 40:
+                    A.append({"type": "Warning", "text": f"{tv[0]['name']} is {tv[0]['pct']}% of all spend — vendor concentration risk."})
+        top_exp = S.get("Top expenses (by category)") or []
+        if top_exp:
+            A.append({"type": "Info", "text": f"Biggest cost: {top_exp[0]['name']} ({_fmt(top_exp[0]['value'])}, {top_exp[0]['pct']}% of spend)."})
+    if inc_mask is not None and inc_mask.any():
+        ia = a[inc_mask]; idf = df[inc_mask]
+        if subcat: S["Revenue by category"]   = _sumrows(idf, subcat, ia, 8)
+        if dept:   S["Revenue by department"]  = _sumrows(idf, dept, ia, 10)
+
+    # ── monthly cash-flow trend (net = income − expense per month) ──
+    if date and (income or expense):
+        try:
+            t = df[[date]].copy()
+            t["_d"] = _to_datetime(df[date]); t["_a"] = a
+            t["_inc"] = a.where(inc_mask, 0.0); t["_exp"] = a.where(exp_mask, 0.0).abs()
+            t = t.dropna(subset=["_d"])
+            m = t.groupby(t["_d"].dt.to_period("M"))
+            net_m = (m["_inc"].sum() - m["_exp"].sum()).sort_index()
+            if len(net_m) >= 2:
+                S["Net cash flow by month"] = [{"month": str(p), "value": round(float(v), 2)} for p, v in net_m.tail(12).items()]
+                rev_m = m["_inc"].sum().sort_index()
+                if float(rev_m.sum()) > 0:
+                    S["Revenue by month"] = [{"month": str(p), "value": round(float(v), 2)} for p, v in rev_m.tail(12).items()]
+                exp_m = m["_exp"].sum().sort_index()
+                if len(exp_m) >= 2 and float(exp_m.iloc[-2]) > 0:
+                    mom = _pct(float(exp_m.iloc[-1] - exp_m.iloc[-2]), float(exp_m.iloc[-2]))
+                    if mom > 20:
+                        A.append({"type": "Warning", "text": f"Expenses jumped {mom}% vs last month — review spend."})
+        except Exception:
+            pass
     return K, S, A
 
 
@@ -1993,7 +2084,7 @@ def _read_and_clean(contents: bytes, name: str, sheet: str = ""):
 _TYPE_SIGNATURES = [
     ("Inventory",    ["stock", "sku", "reorder", "expiry", "balance", "warehouse", "on hand", "inventory", "quantity"]),
     ("Sales",        ["revenue", "sales", "target", "salesperson", "sales person", "order value", "quota"]),
-    ("Finance",      ["budget", "expense", "income", "ledger", "invoice", "profit", "gst", "debit", "credit"]),
+    ("Finance",      ["budget", "expense", "income", "ledger", "invoice", "profit", "gst", "debit", "credit", "vendor", "spend", "payable", "receivable", "cost center", "cash flow", "p&l"]),
     ("HR & Payroll", ["salary", "payroll", "employee", "attrition", "headcount", "designation", "department"]),
     ("Retail",       ["order", "return", "cart", "channel", "ecommerce", "e-commerce"]),
     ("Healthcare",   ["patient", "diagnosis", "doctor", "admission", "ward", "readmission"]),
