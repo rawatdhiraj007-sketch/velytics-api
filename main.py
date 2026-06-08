@@ -2090,6 +2090,69 @@ def build_summary(result: dict, detected_type: str) -> list[dict]:
     return pts[:6]
 
 
+def _apply_edits_and_cleaning(df, fixes, edits_json, clean_options_json):
+    """Apply manual corrections + the client's blank-handling choice. Shared by
+    /analyze and /report so the exported report matches the dashboard exactly."""
+    applied_edits = 0
+    try:
+        edit_list = json.loads(edits_json) if edits_json else []
+    except Exception:
+        edit_list = []
+    if isinstance(edit_list, list):
+        for e in edit_list:
+            try:
+                r = int(e["row"]); c = str(e["col"]); v = e.get("value")
+                if c in df.columns and 0 <= r < len(df):
+                    ci = df.columns.get_loc(c)
+                    if pd.api.types.is_numeric_dtype(df[c]):
+                        v = pd.to_numeric(str(v).replace(",", "").strip(), errors="coerce")
+                    elif v is None:
+                        v = ""
+                    df.iat[r, ci] = v
+                    applied_edits += 1
+            except Exception:
+                pass
+    if applied_edits:
+        fixes.insert(0, f"{applied_edits} manual correction{'s' if applied_edits != 1 else ''} applied before analysis")
+
+    raw_blanks = int(df.isna().sum().sum())
+    try:
+        copts = json.loads(clean_options_json) if clean_options_json else {}
+        if not isinstance(copts, dict):
+            copts = {}
+    except Exception:
+        copts = {}
+    blanks_mode = copts.get("blanks", "leave")
+    if raw_blanks and blanks_mode != "leave":
+        if blanks_mode == "drop_rows":
+            before = len(df)
+            df = df.dropna().reset_index(drop=True)
+            dropped = before - len(df)
+            if dropped:
+                fixes.insert(0, f"Removed {dropped} row(s) containing blanks (your choice)")
+        else:
+            filled = 0
+            for c in df.select_dtypes(include=[np.number]).columns:
+                na = int(df[c].isna().sum())
+                if not na:
+                    continue
+                if blanks_mode == "zero":
+                    fillv = 0.0
+                elif blanks_mode == "mean":
+                    fillv = float(df[c].mean()) if df[c].notna().any() else 0.0
+                elif blanks_mode == "median":
+                    fillv = float(df[c].median()) if df[c].notna().any() else 0.0
+                else:
+                    fillv = None
+                if fillv is not None:
+                    df[c] = df[c].fillna(fillv)
+                    filled += na
+            if filled:
+                label = {"zero": "0", "mean": "the column average", "median": "the column median"}.get(blanks_mode, blanks_mode)
+                fixes.insert(0, f"Filled {filled} blank number(s) with {label} (your choice)")
+    return df, fixes, applied_edits, raw_blanks, blanks_mode
+
+
 @app.post("/analyze")
 async def analyze(
     file: UploadFile = File(...),
@@ -2114,68 +2177,8 @@ async def analyze(
     except Exception as e:
         raise HTTPException(400, f"Could not read file: {str(e)}")
 
-    # ── Apply manual corrections (Version A editing) ──────────────────────────
-    # Cleaning is deterministic, so row indices in the preview map back to df rows.
-    applied_edits = 0
-    try:
-        edit_list = json.loads(edits) if edits else []
-    except Exception:
-        edit_list = []
-    if isinstance(edit_list, list):
-        for e in edit_list:
-            try:
-                r = int(e["row"]); c = str(e["col"]); v = e.get("value")
-                if c in df.columns and 0 <= r < len(df):
-                    ci = df.columns.get_loc(c)
-                    if pd.api.types.is_numeric_dtype(df[c]):
-                        v = pd.to_numeric(str(v).replace(",", "").strip(), errors="coerce")
-                    elif v is None:
-                        v = ""
-                    df.iat[r, ci] = v
-                    applied_edits += 1
-            except Exception:
-                pass
-    if applied_edits:
-        fixes.insert(0, f"{applied_edits} manual correction{'s' if applied_edits != 1 else ''} applied before analysis")
-
-    # ── Cleaning with approval: the client decides how to handle blank cells ──
-    # raw_blanks is measured BEFORE we act, so the UI can always offer the choice.
-    raw_blanks = int(df.isna().sum().sum())
-    try:
-        copts = json.loads(clean_options) if clean_options else {}
-        if not isinstance(copts, dict):
-            copts = {}
-    except Exception:
-        copts = {}
-    blanks_mode = copts.get("blanks", "leave")
-    if raw_blanks and blanks_mode != "leave":
-        if blanks_mode == "drop_rows":
-            before = len(df)
-            df = df.dropna().reset_index(drop=True)
-            dropped = before - len(df)
-            if dropped:
-                fixes.insert(0, f"Removed {dropped} row(s) containing blanks (your choice)")
-        else:
-            num_cols = df.select_dtypes(include=[np.number]).columns
-            filled = 0
-            for c in num_cols:
-                na = int(df[c].isna().sum())
-                if not na:
-                    continue
-                if blanks_mode == "zero":
-                    fillv = 0.0
-                elif blanks_mode == "mean":
-                    fillv = float(df[c].mean()) if df[c].notna().any() else 0.0
-                elif blanks_mode == "median":
-                    fillv = float(df[c].median()) if df[c].notna().any() else 0.0
-                else:
-                    fillv = None
-                if fillv is not None:
-                    df[c] = df[c].fillna(fillv)
-                    filled += na
-            if filled:
-                label = {"zero": "0", "mean": "the column average", "median": "the column median"}.get(blanks_mode, blanks_mode)
-                fixes.insert(0, f"Filled {filled} blank number(s) with {label} (your choice)")
+    # ── Manual corrections + cleaning-with-approval (deterministic indices) ──
+    df, fixes, applied_edits, raw_blanks, blanks_mode = _apply_edits_and_cleaning(df, fixes, edits, clean_options)
 
     # ── Universal adaptive analysis — SAME engine for every module ──
     try:
@@ -2267,6 +2270,143 @@ async def download(
     buf.seek(0)
     return StreamingResponse(buf, media_type=media,
                              headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+# ── Full Excel report: summary + data + a sheet & native chart per breakdown ──
+def _safe_sheet_name(name: str, used: set) -> str:
+    s = "".join(c for c in str(name) if c not in '[]:*?/\\').strip()[:31] or "Sheet"
+    base, i = s, 1
+    while s.lower() in used:
+        suffix = f"_{i}"; s = base[:31 - len(suffix)] + suffix; i += 1
+    used.add(s.lower())
+    return s
+
+def _section_value_key(row: dict):
+    for k in ("value", "revenue", "amount", "total", "count", "qty", "units", "days"):
+        if k in row and isinstance(row[k], (int, float)):
+            return k
+    for k, v in row.items():
+        if k != "pct" and isinstance(v, (int, float)):
+            return k
+    return None
+
+@app.post("/report")
+async def report(
+    file: UploadFile = File(...),
+    module: str = Form(default=""),
+    sheet: str = Form(default=""),
+    filters: str = Form(default=""),
+    edits: str = Form(default=""),
+    clean_options: str = Form(default=""),
+):
+    """Full analytical report as a multi-sheet .xlsx with native Excel charts —
+    mirrors exactly what the dashboard shows (same edits, cleaning, filters)."""
+    from openpyxl import Workbook
+    from openpyxl.chart import BarChart, LineChart, Reference
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    name = file.filename.lower() if file.filename else ""
+    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json"]):
+        raise HTTPException(400, "Unsupported file.")
+    contents = await file.read()
+    try:
+        df, fixes, sheets, sheet_used, currency = _read_and_clean(contents, name, sheet)
+        global _CURRENCY
+        _CURRENCY = currency
+    except Exception as e:
+        raise HTTPException(400, f"Could not read file: {str(e)}")
+
+    df, fixes, _ae, _rb, _bm = _apply_edits_and_cleaning(df, fixes, edits, clean_options)
+    try:
+        flt = json.loads(filters) if filters else {}
+        if not isinstance(flt, dict):
+            flt = {}
+    except Exception:
+        flt = {}
+    try:
+        profile = profile_columns(df)
+        detected_type = (module or detect_type(profile))
+        dff = apply_filters(df, flt)
+        result = analyze_auto(dff, profile)
+        apply_module_pack(detected_type, dff, profile, result)
+        summary = build_summary(result, detected_type)
+    except Exception as e:
+        raise HTTPException(500, f"Report build failed: {str(e)}")
+
+    wb = Workbook()
+    used: set = set()
+    HEAD = Font(bold=True, size=13, color="FFFFFF")
+    SUB = Font(bold=True, color="3730A3")
+    HDRFILL = PatternFill("solid", fgColor="6366F1")
+    THFILL = PatternFill("solid", fgColor="EEF2FF")
+
+    # ── Summary sheet ──
+    ws = wb.active; ws.title = _safe_sheet_name("Summary", used)
+    ws["A1"] = f"{detected_type} Report"; ws["A1"].font = HEAD; ws["A1"].fill = HDRFILL
+    ws.merge_cells("A1:C1"); ws.row_dimensions[1].height = 24
+    ws["A2"] = f"Generated by Velytics  ·  {len(dff):,} rows  ·  currency {currency}"
+    r = 4
+    if summary:
+        ws.cell(r, 1, "At a glance").font = SUB; r += 1
+        for p in summary:
+            ws.cell(r, 1, ("• " + p.get("text", ""))); ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=3); r += 1
+        r += 1
+    K = result.get("kpis") or {}
+    kkeys = [k for k in K if not k.endswith("_fmt")]
+    if kkeys:
+        ws.cell(r, 1, "Key metrics").font = SUB; r += 1
+        ws.cell(r, 1, "Metric").font = Font(bold=True); ws.cell(r, 2, "Value").font = Font(bold=True)
+        ws.cell(r, 1).fill = THFILL; ws.cell(r, 2).fill = THFILL; r += 1
+        for k in kkeys:
+            ws.cell(r, 1, k)
+            val = K.get(k + "_fmt")
+            if val is None:
+                val = K[k]
+            ws.cell(r, 2, val); r += 1
+    ws.column_dimensions["A"].width = 40; ws.column_dimensions["B"].width = 22; ws.column_dimensions["C"].width = 22
+
+    # ── A sheet + chart for each breakdown/trend section ──
+    sections = [(k, v) for k, v in result.items()
+                if isinstance(v, list) and v and isinstance(v[0], dict) and k not in ("alerts", "columns")]
+    for title, rows in sections:
+        try:
+            is_trend = "month" in rows[0]
+            lk = "month" if is_trend else ("name" if "name" in rows[0] else list(rows[0].keys())[0])
+            vk = _section_value_key(rows[0])
+            wss = wb.create_sheet(_safe_sheet_name(title, used))
+            wss.cell(1, 1, lk.title()).font = Font(bold=True); wss.cell(1, 1).fill = THFILL
+            wss.cell(1, 2, title).font = Font(bold=True); wss.cell(1, 2).fill = THFILL
+            for i, row in enumerate(rows, start=2):
+                wss.cell(i, 1, str(row.get(lk, "")))
+                if vk is not None:
+                    wss.cell(i, 2, row.get(vk))
+            wss.column_dimensions["A"].width = 28; wss.column_dimensions["B"].width = 16
+            if vk is not None and len(rows) >= 1:
+                ch = LineChart() if is_trend else BarChart()
+                if not is_trend:
+                    ch.type = "bar"
+                ch.title = title; ch.height = 8.5; ch.width = 17; ch.legend = None
+                data = Reference(wss, min_col=2, min_row=1, max_row=len(rows) + 1)
+                cats = Reference(wss, min_col=1, min_row=2, max_row=len(rows) + 1)
+                ch.add_data(data, titles_from_data=True)
+                ch.set_categories(cats)
+                wss.add_chart(ch, "D2")
+        except Exception:
+            continue
+
+    # ── Cleaned data sheet (last) ──
+    wsd = wb.create_sheet(_safe_sheet_name("Data", used))
+    wsd.append([str(c) for c in dff.columns])
+    for c in range(1, len(dff.columns) + 1):
+        wsd.cell(1, c).font = Font(bold=True); wsd.cell(1, c).fill = THFILL
+    for _, row in dff.iterrows():
+        wsd.append([None if pd.isna(v) else (v if isinstance(v, (int, float, str)) else str(v)) for v in row.tolist()])
+
+    base = (file.filename or "data").rsplit(".", 1)[0]
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{base}_report.xlsx"'})
 
 
 def _mask_pii(s: str) -> str:
