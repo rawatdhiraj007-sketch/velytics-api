@@ -1644,24 +1644,87 @@ def pack_finance(df, profile):
 
 
 def pack_hr(df, profile):
+    """HR / people-analytics — headcount, payroll, attrition, tenure, diversity
+    & pay-gap, performance, overtime/burnout, leave."""
     K, S, A = {}, {}, []
-    sal = _col(profile, "salary", "ctc", "pay", "compensation", role="number")
-    dept = _col(profile, "department", "dept", "team")
-    status = _col(profile, "status", "active", "attrition", "left")
-    perf = _col(profile, "performance", "rating", "score", role="number")
+    sal     = _col(profile, "salary", "ctc", "pay", "compensation", "gross pay", "wage", role="number")
+    dept    = _col(profile, "department", "dept", "team", "function")
+    desig   = _col(profile, "designation", "title", "role", "position", "job title", "grade")
+    gender  = _col(profile, "gender", "sex")
+    age     = _col(profile, "age", role="number")
+    exp     = _col(profile, "experience", "tenure", "years of service", role="number")
+    loc     = _col(profile, "location", "city", "office", "site", "branch")
+    perf    = _col(profile, "performance", "appraisal", "rating", "score", role="number")
+    overtime= _col(profile, "overtime", "ot hours", "extra hours", role="number")
+    leave   = _col(profile, "leave", "absence", "pto", "time off", role="number")
+    status  = _col(profile, "status", "employment status", "active", "attrition")
     K["Headcount"] = len(df)
-    if sal:
-        s = _numv(df, sal); _money_kpi(K, "Total Payroll", float(s.sum())); _money_kpi(K, "Avg Salary", float(s.mean()))
-        if dept: S["Payroll by department"] = _sumrows(df, dept, s, 10)
-    if dept: S["Headcount by department"] = _sumrows(df, dept, pd.Series(1, index=df.index), 10)
+
     if status:
         low = df[status].astype(str).str.lower()
-        left = int(low.str.contains("left|resign|inactive|exit|attrit", na=False).sum())
+        leftm = low.str.contains(r"left|resign|inactive|exit|attrit|terminat|separat", na=False)
+        left = int(leftm.sum())
         if left:
-            K["Attrition %"] = _pct(left, len(df))
-            if _pct(left, len(df)) > 15: A.append({"type": "Warning", "text": f"Attrition is {_pct(left,len(df))}% — high."})
+            K["Active Headcount"] = len(df) - left
+            ar = _pct(left, len(df)); K["Attrition %"] = ar
+            if ar > 15: A.append({"type": "Critical", "text": f"Attrition is {ar}% — above the healthy 10–12% range."})
+            if dept:
+                abd = _countrows(df[leftm], dept, 6)
+                if abd:
+                    S["Resignations by department"] = abd
+                    if abd[0]["count"] >= 3: A.append({"type": "Warning", "text": f"{abd[0]['name']} has the most exits ({abd[0]['count']}) — investigate."})
+
+    if sal:
+        s = _numv(df, sal)
+        _money_kpi(K, "Total Payroll", float(s.sum())); _money_kpi(K, "Avg Salary", float(s.mean()))
+        if dept:
+            try:
+                g = s.groupby(df[dept].astype(str)).mean().sort_values(ascending=False)
+                g = g[~g.index.str.lower().isin(["nan", "none", ""])]
+                if len(g): S["Avg salary by department"] = [{"name": str(k), "value": round(float(v), 0)} for k, v in g.head(10).items()]
+            except Exception: pass
+        if gender:
+            try:
+                gs = s.groupby(df[gender].astype(str)).mean(); gs = gs[~gs.index.str.lower().isin(["nan", "none", ""])]
+                if len(gs) >= 2:
+                    gap = _pct(float(gs.max()) - float(gs.min()), float(gs.max()))
+                    if gap >= 10: A.append({"type": "Warning", "text": f"Gender pay gap of {gap}% — {gs.idxmax()} paid more on average."})
+            except Exception: pass
+
+    if exp: K["Avg Tenure (yrs)"] = round(float(_numv(df, exp).mean()), 1)
+    if age: K["Avg Age"] = round(float(_numv(df, age).mean()), 1)
     if perf:
-        K["Avg Performance"] = round(float(_numv(df, perf).mean()), 1)
+        pv = _numv(df, perf).dropna()
+        if len(pv):
+            K["Avg Performance"] = round(float(pv.mean()), 1)
+            scale = 5 if pv.max() <= 5 else (10 if pv.max() <= 10 else 100)
+            lowp = int((pv < scale * 0.5).sum())
+            if lowp: A.append({"type": "Warning", "text": f"{lowp} employee(s) below half the performance scale."})
+            if dept:
+                try:
+                    g = _numv(df, perf).groupby(df[dept].astype(str)).mean().sort_values()
+                    g = g[~g.index.str.lower().isin(["nan", "none", ""])]
+                    if len(g): S["Avg performance by department"] = [{"name": str(k), "score": round(float(v), 2)} for k, v in g.head(10).items()]
+                except Exception: pass
+
+    if gender:
+        gc = _countrows(df, gender, 6)
+        if gc:
+            S["Gender split"] = gc
+            if gc[0]["pct"] >= 70: A.append({"type": "Info", "text": f"Workforce is {gc[0]['pct']}% {gc[0]['name']} — limited gender balance."})
+    if overtime:
+        ot = _numv(df, overtime).dropna()
+        if len(ot):
+            K["Avg Overtime (hrs)"] = round(float(ot.mean()), 1)
+            burn = int((ot > max(float(ot.mean()) * 2, 20)).sum())
+            if burn: A.append({"type": "Warning", "text": f"{burn} employee(s) logging very high overtime — burnout risk."})
+    if leave:
+        lv = _numv(df, leave).dropna()
+        if len(lv): K["Avg Leave Days"] = round(float(lv.mean()), 1)
+
+    if dept:  S["Headcount by department"] = _countrows(df, dept, 12)
+    if loc:   S["Headcount by location"] = _countrows(df, loc, 10)
+    if desig: S["Headcount by designation"] = _countrows(df, desig, 10)
     return K, S, A
 
 
@@ -1775,159 +1838,474 @@ def pack_retail(df, profile):
 
 
 def pack_logistics(df, profile):
+    """Logistics / fleet — delivery cost & variance, on-time %, delays, damage
+    rate, cost-per-km, route/vehicle/cargo breakdowns and ratings."""
     K, S, A = {}, {}, []
-    cost = _col(profile, "cost", "freight", "charge", "amount", role="number")
-    route = _col(profile, "route", "lane", "destination")
-    driver = _col(profile, "driver", "carrier", "vehicle")
-    status = _col(profile, "status", "delivery", "on time", "ontime")
+    cost    = _col(profile, "delivery cost", "freight", "shipping cost", "cost", "charge", "amount", role="number")
+    budget  = _col(profile, "budget", "planned cost", role="number")
+    route   = _col(profile, "route", "lane", "destination")
+    vehicle = _col(profile, "vehicle", "truck", "fleet")
+    driver  = _col(profile, "driver", "carrier")
+    cargo   = _col(profile, "cargo", "goods type", "commodity")
+    ontime  = _col(profile, "on time", "ontime", "on-time")
+    damaged = _col(profile, "damaged", "damage", "broken")
+    planned_d = _col(profile, "planned delivery", "planned days", "expected days", role="number")
+    actual_d  = _col(profile, "actual delivery", "actual days", "delivery days", role="number")
+    rating  = _col(profile, "rating", "csat", role="number")
+    dist    = _col(profile, "distance", "km", "miles", role="number")
+    weight  = _col(profile, "weight", "load", role="number")
+    date    = _col(profile, "date", "ship date", "dispatch date", role="date")
     K["Shipments"] = len(df)
+
     if cost:
-        c = _numv(df, cost); _money_kpi(K, "Total Cost", float(c.sum())); _money_kpi(K, "Avg Cost/Shipment", float(c.mean()))
-        if route: S["Cost by route"] = _sumrows(df, route, c, 8)
-        if driver: S["Cost by driver"] = _sumrows(df, driver, c, 8)
-    if status:
-        low = df[status].astype(str).str.lower()
-        ontime = int(low.str.contains("on time|ontime|delivered|success", na=False).sum())
-        if ontime:
-            K["On-Time %"] = _pct(ontime, len(df))
-            if _pct(ontime, len(df)) < 80: A.append({"type": "Warning", "text": f"On-time delivery only {_pct(ontime,len(df))}%."})
+        c = _numv(df, cost)
+        _money_kpi(K, "Total Cost", float(c.sum())); _money_kpi(K, "Avg Cost/Shipment", float(c.mean()))
+        if date:
+            try:
+                t = df[[date]].copy(); t["_d"] = _to_datetime(df[date]); t["_c"] = c; t = t.dropna(subset=["_d"])
+                m = t.groupby(t["_d"].dt.to_period("M"))["_c"].sum().sort_index()
+                if len(m) >= 2: S["Monthly delivery cost"] = [{"month": str(p), "value": round(float(v), 2)} for p, v in m.tail(12).items()]
+            except Exception: pass
+        if route:   S["Cost by route"] = _sumrows(df, route, c, 10)
+        if vehicle: S["Cost by vehicle"] = _sumrows(df, vehicle, c, 8)
+        if cargo:   S["Cost by cargo type"] = _sumrows(df, cargo, c, 8)
+        if dist:
+            tk = float(_numv(df, dist).sum())
+            if tk: K["Cost per KM"] = round(float(c.sum()) / tk, 2)
+        if budget:
+            b = float(_numv(df, budget).sum())
+            if b:
+                var = _pct(float(c.sum()) - b, b); K["Cost Variance %"] = var
+                if var > 5: A.append({"type": "Warning", "text": f"Delivery cost is {var}% over budget."})
+
+    if ontime:
+        low = df[ontime].astype(str).str.lower()
+        ot = int(low.str.contains(r"\byes\b|true|on.?time|^1$", na=False).sum())
+        rate = _pct(ot, len(df)); K["On-Time %"] = rate
+        if rate < 85: A.append({"type": "Warning", "text": f"On-time delivery only {rate}% — below the 85% benchmark."})
+    if planned_d and actual_d:
+        delay = (_numv(df, actual_d) - _numv(df, planned_d)).dropna()
+        if len(delay): K["Avg Delay (days)"] = round(float(delay.mean()), 1)
+    elif actual_d:
+        K["Avg Delivery Days"] = round(float(_numv(df, actual_d).mean()), 1)
+    if damaged:
+        low = df[damaged].astype(str).str.lower()
+        dmgm = low.str.contains(r"\byes\b|true|damage|^1$", na=False); dmg = int(dmgm.sum())
+        if dmg:
+            dr = _pct(dmg, len(df)); K["Damage Rate %"] = dr
+            if dr > 3: A.append({"type": "Warning", "text": f"{dmg} damaged shipment(s) ({dr}%) — handling issue."})
+            if cargo:
+                dc = _countrows(df[dmgm], cargo, 6)
+                if dc: S["Damages by cargo type"] = dc
+    if rating:
+        rt = _numv(df, rating).dropna()
+        if len(rt):
+            K["Avg Rating"] = round(float(rt.mean()), 1)
+            if float(rt.mean()) < 3.5: A.append({"type": "Warning", "text": f"Customer rating {round(float(rt.mean()),1)}/5 — service quality slipping."})
+    if weight: K["Avg Weight (KG)"] = round(float(_numv(df, weight).mean()), 1)
+    if driver: S["Shipments by driver"] = _countrows(df, driver, 8)
     return K, S, A
 
 
 def pack_restaurant(df, profile):
+    """Restaurant / F&B — revenue, food-cost & margin, wastage, table occupancy,
+    channel mix (dine-in vs delivery), menu performance, shift & staff, ratings."""
     K, S, A = {}, {}, []
-    rev = _col(profile, "revenue", "sales", "amount", "total", role="number")
-    item = _col(profile, "item", "dish", "menu", "product")
-    shift = _col(profile, "shift", "time", "meal")
-    waste = _col(profile, "waste", "wastage", "spoilage", role="number")
+    rev    = _col(profile, "revenue", "sales", "amount", "total", role="number")
+    qty    = _col(profile, "quantity", "qty", "units sold", "covers", role="number")
+    sell   = _col(profile, "selling price", "sale price", "price", role="number")
+    costp  = _col(profile, "cost price", "food cost", "cost", "cogs", role="number")
+    item   = _col(profile, "menu item", "item", "dish", "product")
+    cat    = _col(profile, "category", "section")
+    channel= _col(profile, "channel", "platform", "source")
+    shift  = _col(profile, "shift", "meal", "daypart")
+    staff  = _col(profile, "staff", "server", "waiter", "employee")
+    occ    = _col(profile, "tables occupied", "occupied", role="number")
+    tott   = _col(profile, "total tables", "tables available", role="number")
+    waste  = _col(profile, "wastage", "waste", "spoilage", role="number")
     rating = _col(profile, "rating", "review", role="number")
-    if rev:
-        r = _numv(df, rev); tot = float(r.sum()); _money_kpi(K, "Total Revenue", tot); K["Orders"] = int(r.notna().sum())
-        if item: S["Top menu items"] = _sumrows(df, item, r, 10)
-        if shift: S["Revenue by shift"] = _sumrows(df, shift, r, 6)
+    date   = _col(profile, "date", role="date")
+    if not rev:
+        return K, S, A
+    r = _numv(df, rev); tot = float(r.sum()); n = int(r.notna().sum()) or 1
+    _money_kpi(K, "Total Revenue", tot); K["Orders"] = n; _money_kpi(K, "Avg Order Value", tot / n)
+    if qty: K["Units Sold"] = int(_numv(df, qty).fillna(0).sum())
+
+    # ── Food cost & margin ──
+    if costp:
+        ctot = float(_numv(df, costp).sum())
+        if sell and qty:
+            ctot = float((_numv(df, costp) * _numv(df, qty)).sum())
+        if tot and ctot:
+            K["Food Cost %"] = _pct(ctot, tot)
+            _money_kpi(K, "Gross Profit", tot - ctot); K["Gross Margin %"] = _pct(tot - ctot, tot)
+            if _pct(ctot, tot) > 35: A.append({"type": "Warning", "text": f"Food cost is {_pct(ctot,tot)}% of revenue — above the 30–35% target."})
+
+    if date:
+        try:
+            t = df[[date]].copy(); t["_d"] = _to_datetime(df[date]); t["_r"] = r; t = t.dropna(subset=["_d"])
+            m = t.groupby(t["_d"].dt.to_period("M"))["_r"].sum().sort_index()
+            if len(m) >= 2: S["Monthly revenue"] = [{"month": str(p), "value": round(float(v), 2)} for p, v in m.tail(12).items()]
+        except Exception: pass
+    if cat:     S["Revenue by category"] = _sumrows(df, cat, r, 8)
+    if item:    S["Top menu items"] = _sumrows(df, item, r, 10)
+    if channel:
+        S["Revenue by channel"] = _sumrows(df, channel, r, 8)
+        tc = S["Revenue by channel"]
+        if tc and tc[0]["pct"] >= 50: A.append({"type": "Info", "text": f"{tc[0]['name']} drives {tc[0]['pct']}% of revenue."})
+    if shift:   S["Revenue by shift"] = _sumrows(df, shift, r, 6)
+    if staff:   S["Top staff by sales"] = _sumrows(df, staff, r, 8)
+
+    # ── Table occupancy ──
+    if occ and tott:
+        o = float(_numv(df, occ).sum()); tt = float(_numv(df, tott).sum())
+        if tt:
+            K["Table Occupancy %"] = _pct(o, tt)
+            if _pct(o, tt) < 50: A.append({"type": "Warning", "text": f"Table occupancy only {_pct(o,tt)}% — capacity under-used."})
+
+    # ── Wastage ──
     if waste:
-        w = float(_numv(df, waste).sum()); K["Total Waste"] = round(w, 1)
-    if rating: K["Avg Rating"] = round(float(_numv(df, rating).mean()), 1)
+        w = _numv(df, waste).fillna(0); K["Wastage Units"] = int(w.sum())
+        if item and float(w.sum()) > 0:
+            try:
+                g = w.groupby(df[item].astype(str)).sum().sort_values(ascending=False)
+                g = g[(g > 0) & ~g.index.str.lower().isin(["nan", "none", ""])]
+                if len(g): S["Most wasted items"] = [{"name": str(k), "units": int(v)} for k, v in g.head(8).items()]
+            except Exception: pass
+
+    if rating:
+        rt = _numv(df, rating).dropna()
+        if len(rt):
+            K["Avg Rating"] = round(float(rt.mean()), 1)
+            if float(rt.mean()) < 3.5: A.append({"type": "Warning", "text": f"Avg rating {round(float(rt.mean()),1)}/5 — guest satisfaction is low."})
     return K, S, A
 
 
 def pack_healthcare(df, profile):
+    """Healthcare — revenue & budget, readmission, bed occupancy, payer mix,
+    department/doctor performance, patient type, ratings."""
     K, S, A = {}, {}, []
-    rev = _col(profile, "revenue", "bill", "amount", "charge", "total", role="number")
-    dept = _col(profile, "department", "ward", "specialty")
-    doctor = _col(profile, "doctor", "physician", "consultant")
+    rev     = _col(profile, "revenue", "bill", "amount", "charge", "total", role="number")
+    budget  = _col(profile, "budget", "planned", role="number")
+    dept    = _col(profile, "department", "ward", "specialty", "unit")
+    doctor  = _col(profile, "doctor", "physician", "consultant")
+    diag    = _col(profile, "diagnosis", "condition", "procedure")
+    ptype   = _col(profile, "patient type", "admission type", "visit type")
+    payer   = _col(profile, "payment type", "payer", "insurance", "payment method")
+    city    = _col(profile, "city", "location", "region")
     readmit = _col(profile, "readmit", "readmission")
+    beddays = _col(profile, "bed days", "bed-days", "occupied beds", role="number")
+    bedsav  = _col(profile, "beds available", "total beds", "capacity", role="number")
+    rating  = _col(profile, "rating", "satisfaction", "csat", role="number")
+    date    = _col(profile, "date", "admission date", "visit date", role="date")
     K["Patients"] = len(df)
+
     if rev:
-        r = _numv(df, rev); _money_kpi(K, "Total Revenue", float(r.sum()))
-        if dept: S["Revenue by department"] = _sumrows(df, dept, r, 10)
+        r = _numv(df, rev); tot = float(r.sum())
+        _money_kpi(K, "Total Revenue", tot); _money_kpi(K, "Avg Revenue/Patient", tot / (len(df) or 1))
+        if date:
+            try:
+                t = df[[date]].copy(); t["_d"] = _to_datetime(df[date]); t["_r"] = r; t = t.dropna(subset=["_d"])
+                m = t.groupby(t["_d"].dt.to_period("M"))["_r"].sum().sort_index()
+                if len(m) >= 2: S["Monthly revenue"] = [{"month": str(p), "value": round(float(v), 2)} for p, v in m.tail(12).items()]
+            except Exception: pass
+        if dept:   S["Revenue by department"] = _sumrows(df, dept, r, 10)
         if doctor: S["Revenue by doctor"] = _sumrows(df, doctor, r, 10)
+        if payer:  S["Revenue by payer"] = _sumrows(df, payer, r, 6)
+        if city:   S["Revenue by city"] = _sumrows(df, city, r, 10)
+        if budget:
+            b = float(_numv(df, budget).sum())
+            if b:
+                var = _pct(tot - b, b); K["Budget Variance %"] = var
+                if var < -10: A.append({"type": "Warning", "text": f"Revenue is {abs(var)}% under budget."})
+
     if readmit:
         low = df[readmit].astype(str).str.lower()
-        rc = int(low.str.contains("yes|true|1|readmit", na=False).sum())
+        rcm = low.str.contains(r"\byes\b|true|^1$|readmit", na=False); rc = int(rcm.sum())
         if rc:
-            K["Readmission %"] = _pct(rc, len(df))
-            if _pct(rc, len(df)) > 10: A.append({"type": "Warning", "text": f"Readmission rate {_pct(rc,len(df))}%."})
+            rr = _pct(rc, len(df)); K["Readmission %"] = rr
+            if rr > 10: A.append({"type": "Critical", "text": f"Readmission rate {rr}% — above the 10% quality threshold."})
+            if dept:
+                rd = _countrows(df[rcm], dept, 6)
+                if rd: S["Readmissions by department"] = rd
+    if beddays and bedsav:
+        bd = float(_numv(df, beddays).sum()); ba = float(_numv(df, bedsav).sum())
+        if ba: K["Bed Occupancy %"] = _pct(bd, ba)
+    if ptype:  S["Patients by type"] = _countrows(df, ptype, 6)
+    if diag:   S["Top diagnoses"] = _countrows(df, diag, 10)
+    if rating:
+        rt = _numv(df, rating).dropna()
+        if len(rt):
+            K["Avg Patient Rating"] = round(float(rt.mean()), 1)
+            if float(rt.mean()) < 3.5: A.append({"type": "Warning", "text": f"Patient rating {round(float(rt.mean()),1)}/5 — experience needs attention."})
     return K, S, A
 
 
 def pack_manufacturing(df, profile):
+    """Manufacturing — output vs plan (efficiency/OEE), defect rate, downtime &
+    causes, production cost & cost/unit, energy, machine/product/shift breakdowns."""
     K, S, A = {}, {}, []
-    actual = _col(profile, "actual", "produced", "output", role="number")
-    planned = _col(profile, "planned", "target", "plan", role="number")
-    defect = _col(profile, "defect", "reject", "scrap", role="number")
-    downtime = _col(profile, "downtime", "stoppage", role="number")
+    actual  = _col(profile, "actual output", "actual", "produced", "output", role="number")
+    planned = _col(profile, "planned output", "planned", "target", "plan", role="number")
+    defect  = _col(profile, "defective", "defect", "reject", "scrap", role="number")
+    downtime= _col(profile, "downtime", "stoppage", role="number")
+    dtcause = _col(profile, "downtime cause", "cause", "reason")
+    dtcost  = _col(profile, "downtime cost", role="number")
+    energy  = _col(profile, "energy", "kwh", "power", "consumption", role="number")
+    labour  = _col(profile, "labour cost", "labor cost", role="number")
+    material= _col(profile, "material cost", "raw material", role="number")
     machine = _col(profile, "machine", "line", "equipment")
+    product = _col(profile, "product", "item", "sku")
+    shift   = _col(profile, "shift", "crew")
+    date    = _col(profile, "date", role="date")
+
     if actual:
-        a = _numv(df, actual); K["Total Output"] = round(float(a.sum()), 0)
+        a = _numv(df, actual); ao = float(a.sum()); K["Total Output"] = round(ao, 0)
         if planned:
             p = float(_numv(df, planned).sum())
             if p:
-                eff = _pct(float(a.sum()), p); K["Efficiency %"] = eff
+                eff = _pct(ao, p); K["Efficiency %"] = eff
                 if eff < 85: A.append({"type": "Warning", "text": f"Output efficiency {eff}% — below 85% of plan."})
-        if machine: S["Output by machine"] = _sumrows(df, machine, a, 10)
-    if defect:
-        d = _numv(df, defect); K["Total Defects"] = round(float(d.sum()), 0)
+        if date:
+            try:
+                t = df[[date]].copy(); t["_d"] = _to_datetime(df[date]); t["_a"] = a; t = t.dropna(subset=["_d"])
+                m = t.groupby(t["_d"].dt.to_period("M"))["_a"].sum().sort_index()
+                if len(m) >= 2: S["Monthly output"] = [{"month": str(p2), "value": round(float(v), 2)} for p2, v in m.tail(12).items()]
+            except Exception: pass
+        if machine: S["Output by machine"] = [{"name": x["name"], "units": int(x["value"]), "pct": x["pct"]} for x in _sumrows(df, machine, a, 10)]
+        if product: S["Output by product"] = [{"name": x["name"], "units": int(x["value"]), "pct": x["pct"]} for x in _sumrows(df, product, a, 10)]
+        if defect:
+            d = _numv(df, defect); dt = float(d.sum()); K["Total Defects"] = round(dt, 0)
+            if ao:
+                K["Defect Rate %"] = _pct(dt, ao + dt)
+                if _pct(dt, ao + dt) > 5: A.append({"type": "Warning", "text": f"Defect rate {_pct(dt, ao+dt)}% — above 5%."})
+            if machine:
+                try:
+                    g = d.groupby(df[machine].astype(str)).sum().sort_values(ascending=False)
+                    g = g[(g > 0) & ~g.index.str.lower().isin(["nan", "none", ""])]
+                    if len(g): S["Defects by machine"] = [{"name": str(k), "units": int(v)} for k, v in g.head(8).items()]
+                except Exception: pass
+
     if downtime:
-        K["Downtime (hrs)"] = round(float(_numv(df, downtime).sum()), 1)
+        dh = _numv(df, downtime); K["Downtime (hrs)"] = round(float(dh.sum()), 1)
+        if dtcause:
+            try:
+                g = dh.groupby(df[dtcause].astype(str)).sum().sort_values(ascending=False)
+                g = g[(g > 0) & ~g.index.str.lower().isin(["nan", "none", ""])]
+                if len(g):
+                    S["Downtime by cause"] = [{"name": str(k), "hours": round(float(v), 1)} for k, v in g.head(8).items()]
+                    A.append({"type": "Info", "text": f"Top downtime cause: {g.index[0]} ({round(float(g.iloc[0]),1)} hrs)."})
+            except Exception: pass
+    if dtcost: _money_kpi(K, "Downtime Cost", float(_numv(df, dtcost).sum()))
+    if labour or material:
+        pc = 0.0
+        if labour: pc += float(_numv(df, labour).sum())
+        if material: pc += float(_numv(df, material).sum())
+        if pc:
+            _money_kpi(K, "Production Cost", pc)
+            if actual and float(_numv(df, actual).sum()): K["Cost per Unit"] = round(pc / float(_numv(df, actual).sum()), 2)
+    if energy: K["Energy (KWH)"] = round(float(_numv(df, energy).sum()), 0)
     return K, S, A
 
 
 def pack_marketing(df, profile):
+    """Marketing — spend, revenue, ROAS, CAC, funnel (impressions→clicks→leads→
+    conversions), CTR & conversion rate, channel/campaign/geo performance."""
     K, S, A = {}, {}, []
-    spend = _col(profile, "spend", "cost", "budget", role="number")
-    rev = _col(profile, "revenue", "sales", "conversion value", role="number")
-    leads = _col(profile, "lead", "leads", "signup", role="number")
-    channel = _col(profile, "channel", "campaign", "source", "platform")
+    spend   = _col(profile, "spend", "cost", "budget", "ad spend", role="number")
+    rev     = _col(profile, "revenue generated", "revenue", "sales", "conversion value", role="number")
+    impr    = _col(profile, "impressions", "views", "reach", role="number")
+    clicks  = _col(profile, "clicks", "click", role="number")
+    leads   = _col(profile, "leads", "lead", "signup", role="number")
+    conv    = _col(profile, "conversions", "conversion", "purchases", "orders", role="number")
+    channel = _col(profile, "channel", "source", "platform", "medium")
+    campaign= _col(profile, "campaign", "ad", "initiative")
+    city    = _col(profile, "city", "region", "location", "geo")
+    date    = _col(profile, "date", role="date")
+
     if spend:
-        sp = _numv(df, spend); _money_kpi(K, "Total Spend", float(sp.sum()))
-        if channel: S["Spend by channel"] = _sumrows(df, channel, sp, 8)
+        sp = _numv(df, spend); spv = float(sp.sum())
+        _money_kpi(K, "Total Spend", spv)
         if rev:
-            rv = float(_numv(df, rev).sum()); spv = float(sp.sum())
-            if spv: K["ROAS"] = round(rv / spv, 2)
-            if spv and rv / spv < 1: A.append({"type": "Warning", "text": f"ROAS is {round(rv/spv,2)}x — spending more than earning."})
+            rv = float(_numv(df, rev).sum()); _money_kpi(K, "Revenue Generated", rv)
+            if spv:
+                K["ROAS"] = round(rv / spv, 2)
+                if rv / spv < 1: A.append({"type": "Critical", "text": f"ROAS is {round(rv/spv,2)}x — spending more than you earn."})
+                elif rv / spv >= 4: A.append({"type": "Opportunity", "text": f"Strong {round(rv/spv,2)}x ROAS — scale what's working."})
+        if date:
+            try:
+                t = df[[date]].copy(); t["_d"] = _to_datetime(df[date]); t["_s"] = sp; t = t.dropna(subset=["_d"])
+                m = t.groupby(t["_d"].dt.to_period("M"))["_s"].sum().sort_index()
+                if len(m) >= 2: S["Monthly spend"] = [{"month": str(p), "value": round(float(v), 2)} for p, v in m.tail(12).items()]
+            except Exception: pass
+        if channel: S["Spend by channel"] = _sumrows(df, channel, sp, 8)
+
+    if conv: K["Conversions"] = int(_numv(df, conv).fillna(0).sum())
+    if leads: K["Total Leads"] = int(_numv(df, leads).fillna(0).sum())
+    if spend and conv:
+        cv = float(_numv(df, conv).fillna(0).sum())
+        if cv: _money_kpi(K, "CAC", float(_numv(df, spend).sum()) / cv)
+    if clicks and impr:
+        ci = float(_numv(df, impr).sum())
+        if ci: K["CTR %"] = _pct(float(_numv(df, clicks).sum()), ci)
+    if conv and clicks:
+        cl = float(_numv(df, clicks).sum())
+        if cl: K["Conversion Rate %"] = _pct(float(_numv(df, conv).sum()), cl)
+
     if rev and channel:
         S["Revenue by channel"] = _sumrows(df, channel, _numv(df, rev), 8)
-    if leads:
-        K["Total Leads"] = int(_numv(df, leads).sum())
+        # ROAS by channel
+        if spend:
+            try:
+                gs = _numv(df, spend).groupby(df[channel].astype(str)).sum()
+                gr = _numv(df, rev).groupby(df[channel].astype(str)).sum()
+                roas = (gr / gs.replace(0, np.nan)).dropna().sort_values(ascending=False)
+                roas = roas[~roas.index.str.lower().isin(["nan", "none", ""])]
+                if len(roas):
+                    S["ROAS by channel"] = [{"name": str(k), "roas": round(float(v), 2)} for k, v in roas.head(8).items()]
+                    if float(roas.iloc[-1]) < 1: A.append({"type": "Warning", "text": f"{roas.index[-1]} is unprofitable ({round(float(roas.iloc[-1]),2)}x ROAS) — cut or fix it."})
+            except Exception: pass
+    if campaign: S["Spend by campaign"] = _sumrows(df, campaign, _numv(df, spend), 8) if spend else None
+    if conv and channel: S["Conversions by channel"] = [{"name": x["name"], "units": int(x["value"]), "pct": x["pct"]} for x in _sumrows(df, channel, _numv(df, conv), 8)]
+    if city and rev: S["Revenue by city"] = _sumrows(df, city, _numv(df, rev), 10)
+    S = {k: v for k, v in S.items() if v}
     return K, S, A
 
 
 def pack_education(df, profile):
+    """Education — scores & pass rate, attendance, fee collection & dues, dropout,
+    performance by class/subject/teacher, gender split."""
     K, S, A = {}, {}, []
-    score = _col(profile, "score", "marks", "grade", "percentage", "result", role="number")
-    att = _col(profile, "attendance", "present", role="number")
-    fees = _col(profile, "fee", "fees", "paid", "amount", role="number")
-    cls = _col(profile, "class", "section", "standard", "grade")
-    subj = _col(profile, "subject", "course")
-    student = _col(profile, "student", "name", "roll")
+    score   = _col(profile, "avg score", "score", "marks", "percentage", "result", "grade", role="number")
+    maxsc   = _col(profile, "max score", "maximum score", "out of", role="number")
+    present = _col(profile, "students present", "present", "attended", role="number")
+    totstu  = _col(profile, "total students", "enrolled", "strength", "class size", role="number")
+    passcol = _col(profile, "pass")
+    fee_ch  = _col(profile, "fee charged", "fees charged", "fee due", "billed", role="number")
+    fee_pd  = _col(profile, "fee paid", "fees paid", "collected", "received", role="number")
+    cls     = _col(profile, "class", "section", "standard", "batch")
+    subj    = _col(profile, "subject", "course")
+    teacher = _col(profile, "teacher", "faculty", "instructor", "professor")
+    gender  = _col(profile, "gender", "sex")
+    sstatus = _col(profile, "student status", "status", "enrollment status")
+
     if score:
         s = _numv(df, score)
-        K["Average Score"] = round(float(s.mean()), 1)
-        passed = int((s >= 40).sum()); tot = int(s.notna().sum()) or 1
-        K["Pass Rate %"] = _pct(passed, tot)
-        if _pct(passed, tot) < 60: A.append({"type": "Warning", "text": f"Pass rate {_pct(passed,tot)}% — many below 40."})
-        if cls:  S["Average score by class"] = _meanrows(df, cls, s, 12)
-        if subj: S["Average score by subject"] = _meanrows(df, subj, s, 12)
-    if att:
-        a = _numv(df, att); a = a * 100 if a.max() <= 1.5 else a
-        K["Avg Attendance %"] = round(float(a.mean()), 1)
-        low = int((a < 40).sum())
-        if low: A.append({"type": "Critical", "text": f"{low} student(s) below 40% attendance."})
-    if fees:
-        _money_kpi(K, "Fees Collected", float(_numv(df, fees).sum()))
-    if score and att and student:
-        try:
-            s = _numv(df, score); a = _numv(df, att); a = a * 100 if a.max() <= 1.5 else a
-            mask = (s < 40) & (a < 50)
-            names = df.loc[mask, student].astype(str).head(15).tolist()
-            if names:
-                S["At-risk students (low score & attendance)"] = [{"name": n, "value": 0} for n in names]
-                A.append({"type": "Critical", "text": f"{int(mask.sum())} at-risk student(s): low score AND attendance."})
-        except Exception:
-            pass
+        K["Avg Score"] = round(float(s.mean()), 1)
+        if maxsc:
+            mx = float(_numv(df, maxsc).mean())
+            if mx: K["Score %"] = _pct(float(s.mean()), mx)
+        if cls:     S["Avg score by class"] = [{"name": x["name"], "score": round(x["value"], 1)} for x in _meanrows(df, cls, s, 12)]
+        if subj:    S["Avg score by subject"] = [{"name": x["name"], "score": round(x["value"], 1)} for x in _meanrows(df, subj, s, 12)]
+        if teacher: S["Avg score by teacher"] = [{"name": x["name"], "score": round(x["value"], 1)} for x in _meanrows(df, teacher, s, 10)]
+    # ── Pass rate (from a pass flag, else score ≥ 40) ──
+    if passcol:
+        low = df[passcol].astype(str).str.lower(); passed = int(low.str.contains(r"\byes\b|true|pass|^1$", na=False).sum())
+        pr = _pct(passed, len(df)); K["Pass Rate %"] = pr
+        if pr < 60: A.append({"type": "Warning", "text": f"Pass rate {pr}% — over a third of students failing."})
+    elif score:
+        s = _numv(df, score); pr = _pct(int((s >= 40).sum()), int(s.notna().sum()) or 1); K["Pass Rate %"] = pr
+        if pr < 60: A.append({"type": "Warning", "text": f"Pass rate {pr}% — many below the pass mark."})
+
+    # ── Attendance ──
+    if present and totstu:
+        p = float(_numv(df, present).sum()); t = float(_numv(df, totstu).sum())
+        if t:
+            K["Attendance %"] = _pct(p, t)
+            if _pct(p, t) < 75: A.append({"type": "Warning", "text": f"Attendance {_pct(p,t)}% — below 75%."})
+            if cls:
+                try:
+                    pr_ = _numv(df, present).groupby(df[cls].astype(str)).sum()
+                    tr_ = _numv(df, totstu).groupby(df[cls].astype(str)).sum()
+                    at = (pr_ / tr_.replace(0, np.nan) * 100).dropna().sort_values()
+                    at = at[~at.index.str.lower().isin(["nan", "none", ""])]
+                    if len(at): S["Attendance by class"] = [{"name": str(k), "rate": round(float(v), 1)} for k, v in at.head(12).items()]
+                except Exception: pass
+
+    # ── Fees ──
+    if fee_pd:
+        paid = float(_numv(df, fee_pd).sum()); _money_kpi(K, "Fees Collected", paid)
+        if fee_ch:
+            ch = float(_numv(df, fee_ch).sum())
+            if ch:
+                K["Fee Collection %"] = _pct(paid, ch)
+                if ch > paid: _money_kpi(K, "Outstanding Fees", ch - paid)
+                if _pct(paid, ch) < 80: A.append({"type": "Warning", "text": f"Only {_pct(paid,ch)}% of fees collected — {_fmt(ch-paid)} outstanding."})
+        if cls: S["Fees collected by class"] = _sumrows(df, cls, _numv(df, fee_pd), 12)
+
+    # ── Dropout ──
+    if sstatus:
+        low = df[sstatus].astype(str).str.lower(); dropm = low.str.contains(r"drop|left|inactive|discontinu", na=False); dropped = int(dropm.sum())
+        if dropped:
+            dr = _pct(dropped, len(df)); K["Dropout %"] = dr
+            if dr > 10: A.append({"type": "Critical", "text": f"Dropout rate {dr}% — high student churn."})
+            if cls:
+                dc = _countrows(df[dropm], cls, 8)
+                if dc: S["Dropouts by class"] = dc
+    if gender: S["Gender split"] = _countrows(df, gender, 6)
     return K, S, A
 
 
 def pack_banking(df, profile):
+    """Banking / lending — disbursement, outstanding, NPA, collection efficiency,
+    overdue, interest & ticket size, branch/agent/product/geo & NPA concentration."""
     K, S, A = {}, {}, []
-    disb = _col(profile, "disbursed", "loan amount", "amount", "principal", role="number")
-    out = _col(profile, "outstanding", "balance", "due", role="number")
-    status = _col(profile, "status", "npa", "default", "overdue")
-    branch = _col(profile, "branch", "region")
-    agent = _col(profile, "agent", "officer", "rm")
+    disb    = _col(profile, "loan amount", "disbursed", "principal", "sanctioned", "amount", role="number")
+    out     = _col(profile, "outstanding", "balance", "due amount", role="number")
+    status  = _col(profile, "status", "npa", "default", "loan status")
+    branch  = _col(profile, "branch", "region")
+    agent   = _col(profile, "agent", "officer", "rm", "relationship manager")
+    ltype   = _col(profile, "loan type", "product", "scheme", "loan product")
+    state   = _col(profile, "state", "province")
+    rate    = _col(profile, "interest rate", "interest", "roi", role="number")
+    tenure  = _col(profile, "tenure", "term", "duration", role="number")
+    overdue = _col(profile, "days overdue", "overdue", "dpd", role="number")
+    coll    = _col(profile, "collection", "recovery", "repaid", role="number")
+    date    = _col(profile, "date", "disbursal date", role="date")
+
     if disb:
-        d = _numv(df, disb); _money_kpi(K, "Total Disbursed", float(d.sum())); K["Loans"] = int(d.notna().sum())
+        d = _numv(df, disb)
+        _money_kpi(K, "Total Disbursed", float(d.sum())); K["Loans"] = int(d.notna().sum())
+        _money_kpi(K, "Avg Ticket Size", float(d.mean()))
+        if date:
+            try:
+                t = df[[date]].copy(); t["_d"] = _to_datetime(df[date]); t["_a"] = d; t = t.dropna(subset=["_d"])
+                m = t.groupby(t["_d"].dt.to_period("M"))["_a"].sum().sort_index()
+                if len(m) >= 2: S["Monthly disbursement"] = [{"month": str(p), "value": round(float(v), 2)} for p, v in m.tail(12).items()]
+            except Exception: pass
         if branch: S["Disbursed by branch"] = _sumrows(df, branch, d, 10)
-        if agent: S["Disbursed by agent"] = _sumrows(df, agent, d, 10)
-    if out:
-        _money_kpi(K, "Outstanding", float(_numv(df, out).sum()))
+        if ltype:  S["Disbursed by loan type"] = _sumrows(df, ltype, d, 10)
+        if state:  S["Disbursed by state"] = _sumrows(df, state, d, 10)
+        if agent:  S["Top agents by disbursal"] = _sumrows(df, agent, d, 8)
+    if out: _money_kpi(K, "Outstanding", float(_numv(df, out).sum()))
+    if rate: K["Avg Interest Rate %"] = round(float(_numv(df, rate).mean()), 2)
+    if tenure: K["Avg Tenure (mo)"] = round(float(_numv(df, tenure).mean()), 1)
+    if coll:
+        cv = _numv(df, coll).dropna()
+        if len(cv):
+            K["Avg Collection %"] = round(float(cv.mean()), 1)
+            if float(cv.mean()) < 80: A.append({"type": "Warning", "text": f"Collection efficiency {round(float(cv.mean()),1)}% — recovery lagging."})
+    if overdue:
+        od = _numv(df, overdue).fillna(0); odn = int((od > 0).sum())
+        if odn:
+            K["Overdue Loans"] = odn
+            if _pct(odn, len(df)) > 15: A.append({"type": "Warning", "text": f"{odn} loans overdue ({_pct(odn,len(df))}%) — collection risk."})
+
     if status:
         low = df[status].astype(str).str.lower()
-        npa = int(low.str.contains("npa|default|overdue|bad", na=False).sum())
+        npam = low.str.contains(r"npa|default|overdue|bad|non.?perform", na=False); npa = int(npam.sum())
         if npa:
-            K["NPA %"] = _pct(npa, len(df))
-            if _pct(npa, len(df)) > 5: A.append({"type": "Critical", "text": f"NPA rate {_pct(npa,len(df))}% — above 5%."})
+            nr = _pct(npa, len(df)); K["NPA %"] = nr
+            if out: _money_kpi(K, "NPA Amount", float(_numv(df, out)[npam].sum()))
+            if nr > 5: A.append({"type": "Critical", "text": f"NPA rate {nr}% — above the 5% red line."})
+            if branch:
+                nb = _countrows(df[npam], branch, 6)
+                if nb: S["NPA by branch"] = nb
+            if ltype:
+                nl = _countrows(df[npam], ltype, 6)
+                if nl:
+                    S["NPA by loan type"] = nl
+                    A.append({"type": "Warning", "text": f"{nl[0]['name']} has the most NPAs ({nl[0]['count']} loans)."})
     return K, S, A
 
 
