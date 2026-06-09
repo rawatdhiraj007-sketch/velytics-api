@@ -8,3 +8,4 @@ scikit-learn==1.4.2
 statsmodels==0.14.2
 Pillow
 piexif
+pillow-heif

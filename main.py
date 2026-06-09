@@ -2648,66 +2648,82 @@ def scan_footprint(contents: bytes, name: str, df: pd.DataFrame | None = None) -
 # IMAGE / PHOTO METADATA — photos secretly carry GPS location, camera, owner,
 # date. Same "find → show → clean" model as spreadsheets, just an EXIF reader.
 # ════════════════════════════════════════════════════════════════════════════
-_IMG_EXT = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp")
+_IMG_EXT = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp", ".heic", ".heif")
 
-def _gps_to_dec(dms, ref):
+def _register_heif():
     try:
-        d = dms[0][0] / dms[0][1]; m = dms[1][0] / dms[1][1]; s = dms[2][0] / dms[2][1]
+        import pillow_heif; pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+
+def _gps_dec(v, ref):
+    try:
+        d = float(v[0]); m = float(v[1]); s = float(v[2])
         dec = d + m / 60 + s / 3600
-        r = ref.decode() if isinstance(ref, bytes) else str(ref)
+        r = (ref.decode() if isinstance(ref, bytes) else str(ref)).strip()
         return -dec if r in ("S", "W") else dec
     except Exception:
         return None
 
 def scan_image(contents: bytes, name: str) -> dict:
-    """Read what a photo secretly reveals — GPS location, camera, owner, date."""
-    rep = {"applicable": True, "kind": "image", "leaked": {}, "maps": "", "risks": [], "pii": {}, "score": 100}
+    """Read what a photo secretly reveals — GPS location, camera, owner, date.
+    Uses Pillow's universal EXIF reader so JPEG, HEIC (iPhone), PNG, TIFF all work.
+    Each item is tagged with a category so the client can pick what to remove."""
+    rep = {"applicable": True, "kind": "image", "leaked": {}, "maps": "", "risks": [],
+           "pii": {}, "score": 100, "readable": True}
     try:
-        import piexif
-        ex = piexif.load(contents)
-        g = lambda ifd, tag: ex.get(ifd, {}).get(tag)
-        dec = lambda b: (b.decode(errors="ignore") if isinstance(b, bytes) else str(b)).strip("\x00 ").strip()
-        make = g("0th", piexif.ImageIFD.Make); model = g("0th", piexif.ImageIFD.Model)
-        if make or model: rep["leaked"]["Camera"] = (dec(make or b"") + " " + dec(model or b"")).strip()
-        sw = g("0th", piexif.ImageIFD.Software)
-        if sw: rep["leaked"]["Software"] = dec(sw)
-        art = g("0th", piexif.ImageIFD.Artist)
-        cpy = g("0th", piexif.ImageIFD.Copyright)
-        if art: rep["leaked"]["Author / owner"] = dec(art)
-        if cpy: rep["leaked"]["Copyright"] = dec(cpy)
-        dt = g("Exif", piexif.ExifIFD.DateTimeOriginal) or g("0th", piexif.ImageIFD.DateTime)
-        if dt: rep["leaked"]["Date taken"] = dec(dt)
-        gps = ex.get("GPS", {})
-        if gps.get(piexif.GPSIFD.GPSLatitude):
-            lat = _gps_to_dec(gps[piexif.GPSIFD.GPSLatitude], gps.get(piexif.GPSIFD.GPSLatitudeRef, b"N"))
-            lon = _gps_to_dec(gps[piexif.GPSIFD.GPSLongitude], gps.get(piexif.GPSIFD.GPSLongitudeRef, b"E"))
+        from PIL import Image, ExifTags
+        _register_heif()
+        img = Image.open(io.BytesIO(contents))
+        exif = img.getexif()
+        def txt(v):
+            if isinstance(v, bytes): v = v.decode(errors="ignore")
+            return str(v).strip("\x00 ").strip()
+        make = exif.get(271); model = exif.get(272); sw = exif.get(305)
+        art = exif.get(315); cpy = exif.get(33432); dt0 = exif.get(306)
+        try: sub = exif.get_ifd(ExifTags.IFD.Exif)
+        except Exception: sub = {}
+        dto = sub.get(36867) if sub else None
+        if make or model: rep["leaked"]["Camera"] = (txt(make or "") + " " + txt(model or "")).strip()
+        if sw:  rep["leaked"]["Software"] = txt(sw)
+        if art: rep["leaked"]["Author / owner"] = txt(art)
+        if cpy: rep["leaked"]["Copyright"] = txt(cpy)
+        dv = dto or dt0
+        if dv: rep["leaked"]["Date taken"] = txt(dv)
+        try: gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+        except Exception: gps = {}
+        if gps and gps.get(2) and gps.get(4):
+            lat = _gps_dec(gps.get(2), gps.get(1, "N")); lon = _gps_dec(gps.get(4), gps.get(3, "E"))
             if lat is not None and lon is not None:
                 rep["leaked"]["GPS location"] = f"{lat:.5f}, {lon:.5f}"
                 rep["maps"] = f"https://maps.google.com/?q={lat},{lon}"
     except Exception:
-        pass
+        rep["readable"] = False
 
     s, R = 100, rep["risks"]
     if "GPS location" in rep["leaked"]:
         s -= 35; R.append({"label": f"📍 GPS location embedded: {rep['leaked']['GPS location']}", "severity": "high",
-                           "detail": "This reveals exactly where the photo was taken — a real safety risk."})
+                           "cat": "gps", "detail": "This reveals exactly where the photo was taken — a real safety risk."})
     if "Author / owner" in rep["leaked"] or "Copyright" in rep["leaked"]:
         s -= 15; R.append({"label": f"Owner identity: {rep['leaked'].get('Author / owner') or rep['leaked'].get('Copyright')}", "severity": "high",
-                           "detail": "Your name / copyright is stored inside the photo."})
+                           "cat": "owner", "detail": "Your name / copyright is stored inside the photo."})
     if "Camera" in rep["leaked"] or "Software" in rep["leaked"]:
         s -= 10; R.append({"label": f"Device info: {rep['leaked'].get('Camera','')} {rep['leaked'].get('Software','')}".strip(), "severity": "medium",
-                           "detail": "The exact device and software are recorded."})
+                           "cat": "camera", "detail": "The exact device and software are recorded."})
     if "Date taken" in rep["leaked"]:
         s -= 5; R.append({"label": f"Date/time taken: {rep['leaked']['Date taken']}", "severity": "low",
-                          "detail": "When the photo was captured."})
+                          "cat": "date", "detail": "When the photo was captured."})
     rep["score"] = max(0, min(100, s))
+    rep["categories_present"] = sorted({r.get("cat") for r in R if r.get("cat")})
     if not R:
-        R.append({"label": "No hidden metadata found — this photo is clean", "severity": "ok", "detail": ""})
+        msg = ("No hidden metadata found — this photo is clean (apps like WhatsApp/Instagram strip it on send)."
+               if rep["readable"] else "Couldn't read this image format — try a JPG/PNG/HEIC original.")
+        R.append({"label": msg, "severity": "ok", "detail": ""})
     has_loc = "GPS location" in rep["leaked"]; has_id = "Author / owner" in rep["leaked"] or "Copyright" in rep["leaked"]
     rep["gdpr"] = ({"personal_data": True, "level": "high",
                     "verdict": "This photo reveals personal data — strip it before posting or sharing.",
                     "categories": [k for k in ("GPS location", "Author / owner", "Date taken") if k in rep["leaked"]],
-                    "advice": "Download the cleaned photo below — it looks identical but carries no hidden data."}
+                    "advice": "Tick what to remove below, then clean & download — the photo looks identical."}
                    if (has_loc or has_id) else
                    {"personal_data": False, "level": "ok" if not rep["leaked"] else "medium",
                     "verdict": "No location or identity found." if not rep["leaked"] else "Minor device metadata only — low risk.",
@@ -2715,19 +2731,47 @@ def scan_image(contents: bytes, name: str) -> dict:
                     "advice": "You can still strip the remaining metadata below."})
     return rep
 
-def strip_image(contents: bytes) -> tuple[bytes, str]:
-    """Return a visually-identical copy with ALL metadata removed."""
+def strip_image(contents: bytes, name: str = "", categories=None) -> tuple[bytes, str]:
+    """Return a visually-identical copy with the SELECTED metadata removed.
+    categories: list subset of {gps,camera,owner,date}; None/empty = remove all."""
     from PIL import Image
+    nm = (name or "").lower()
+    if nm.endswith((".heic", ".heif")):
+        _register_heif()
     img = Image.open(io.BytesIO(contents))
     fmt = (img.format or "JPEG").upper()
-    save_fmt = "JPEG" if fmt in ("JPG", "JPEG") else fmt
+    is_jpeg = nm.endswith((".jpg", ".jpeg")) or fmt in ("JPEG", "JPG", "MPO")
+    ALL = {"gps", "camera", "owner", "date"}
+    cats = ALL if not categories else (set(categories) & ALL or ALL)
+
+    # JPEG + a partial selection → edit EXIF in place (keeps the rest, no re-encode)
+    if is_jpeg and cats != ALL:
+        try:
+            import piexif
+            ex = piexif.load(contents)
+            if "gps" in cats: ex["GPS"] = {}
+            if "camera" in cats:
+                for t in (piexif.ImageIFD.Make, piexif.ImageIFD.Model, piexif.ImageIFD.Software):
+                    ex["0th"].pop(t, None)
+            if "owner" in cats:
+                for t in (piexif.ImageIFD.Artist, piexif.ImageIFD.Copyright):
+                    ex["0th"].pop(t, None)
+            if "date" in cats:
+                ex["Exif"].pop(piexif.ExifIFD.DateTimeOriginal, None)
+                ex["0th"].pop(piexif.ImageIFD.DateTime, None)
+            nb = piexif.dump(ex)
+            out = io.BytesIO(); piexif.insert(nb, contents, out); out.seek(0)
+            return out.read(), "JPEG"
+        except Exception:
+            pass
+
+    # Full strip — re-encode with no metadata at all
+    save_fmt = "JPEG" if (is_jpeg or nm.endswith((".heic", ".heif"))) else fmt
     clean = Image.new(img.mode, img.size)
     clean.putdata(list(img.getdata()))
     if save_fmt == "JPEG" and clean.mode in ("RGBA", "P", "LA"):
         clean = clean.convert("RGB")
-    out = io.BytesIO()
-    clean.save(out, format=save_fmt)
-    out.seek(0)
+    out = io.BytesIO(); clean.save(out, format=save_fmt); out.seek(0)
     return out.read(), save_fmt
 
 
@@ -3317,17 +3361,23 @@ async def scrub(
     redact_pii: bool = Form(False),      # mask emails / phones / IDs in cells
     remove_columns: str = Form(default=""),  # JSON list of column headers to delete entirely (manual)
     remove_words: str = Form(default=""),    # JSON list of words → blank any cell containing them (manual)
+    strip_categories: str = Form(default=""),  # images: JSON list subset of {gps,camera,owner,date}; empty = all
 ):
     """Return a privacy-clean copy, applying ONLY the options the user selected —
     machine-detected items (identity/hidden/comments/PII) PLUS the client's own
     manual picks (remove whole columns, blank cells containing chosen words)."""
     name = file.filename.lower() if file.filename else ""
 
-    # ── Image path: strip ALL EXIF/metadata, return a clean photo ──
+    # ── Image path: strip the SELECTED EXIF categories, return a clean photo ──
     if name.endswith(_IMG_EXT):
         contents = await file.read()
         try:
-            clean, fmt = strip_image(contents)
+            cats = json.loads(strip_categories) if strip_categories else None
+            if not isinstance(cats, list): cats = None
+        except Exception:
+            cats = None
+        try:
+            clean, fmt = strip_image(contents, name, cats)
         except Exception as e:
             raise HTTPException(500, f"Could not clean image: {str(e)}")
         ext = "jpg" if fmt == "JPEG" else fmt.lower()
