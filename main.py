@@ -3100,6 +3100,103 @@ def clean_document(contents: bytes, name: str) -> bytes:
     out.seek(0); return out.read()
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# VIDEO METADATA — phone videos (MP4/MOV) embed GPS location, device & date,
+# just like photos. Read via ffmpeg, strip with ffmpeg -map_metadata -1 -c copy
+# (no re-encode → fast, no quality loss).
+# ════════════════════════════════════════════════════════════════════════════
+_VIDEO_EXT = (".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm")
+_VIDEO_MAX = 250 * 1024 * 1024   # 250 MB cap (keeps the in-memory model safe)
+
+def _ffmpeg_exe():
+    import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+def scan_video(contents: bytes, name: str) -> dict:
+    import tempfile, subprocess, os
+    rep = {"applicable": True, "kind": "video", "leaked": {}, "maps": "", "risks": [],
+           "pii": {}, "score": 100, "details": {}, "readable": True}
+    tmp = None
+    try:
+        ext = "." + name.rsplit(".", 1)[-1]
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+            f.write(contents); tmp = f.name
+        info = subprocess.run([_ffmpeg_exe(), "-i", tmp], capture_output=True, text=True, timeout=90).stderr
+        def grab(key):
+            m = re.search(rf"^\s*{key}\s*:\s*(.+?)\s*$", info, re.I | re.M)
+            return m.group(1).strip() if m else ""
+        make = grab(r"com\.apple\.quicktime\.make") or grab(r"make")
+        model = grab(r"com\.apple\.quicktime\.model") or grab(r"model")
+        sw = grab(r"com\.apple\.quicktime\.software") or grab(r"encoder")
+        ct = grab(r"com\.apple\.quicktime\.creationdate") or grab(r"creation_time")
+        loc = grab(r"com\.apple\.quicktime\.location\.iso6709") or grab(r"location")
+        if make or model: rep["leaked"]["Camera"] = (make + " " + model).strip()
+        if sw: rep["leaked"]["Software"] = sw
+        if ct: rep["leaked"]["Date taken"] = ct
+        if loc:
+            mll = re.match(r"\s*([+-]\d+\.?\d*)([+-]\d+\.?\d*)", loc)
+            if mll:
+                lat = float(mll.group(1)); lon = float(mll.group(2))
+                rep["leaked"]["GPS location"] = f"{lat:.5f}, {lon:.5f}"
+                rep["maps"] = f"https://maps.google.com/?q={lat},{lon}"
+        det = rep["details"]
+        d = re.search(r"Duration:\s*([0-9:.]+)", info)
+        r = re.search(r", (\d{3,5}x\d{3,5})", info)
+        if d: det["Duration"] = d.group(1)
+        if r: det["Resolution"] = r.group(1)
+        det["Size"] = f"{len(contents)/1024/1024:.1f} MB"
+    except Exception:
+        rep["readable"] = False
+    finally:
+        if tmp and os.path.exists(tmp):
+            try: os.remove(tmp)
+            except Exception: pass
+
+    s, R = 100, rep["risks"]
+    if "GPS location" in rep["leaked"]:
+        s -= 35; R.append({"label": f"📍 GPS location embedded: {rep['leaked']['GPS location']}", "severity": "high",
+                           "cat": "gps", "detail": "This video reveals exactly where it was filmed — a real safety risk."})
+    if "Camera" in rep["leaked"] or "Software" in rep["leaked"]:
+        s -= 10; R.append({"label": f"Device info: {rep['leaked'].get('Camera','')} {rep['leaked'].get('Software','')}".strip(), "severity": "medium",
+                           "cat": "camera", "detail": "The exact device and software are recorded."})
+    if "Date taken" in rep["leaked"]:
+        s -= 5; R.append({"label": f"Date/time filmed: {rep['leaked']['Date taken']}", "severity": "low",
+                          "cat": "date", "detail": "When the video was captured."})
+    rep["score"] = max(0, min(100, s))
+    rep["categories_present"] = sorted({r2.get("cat") for r2 in R if r2.get("cat")})
+    if not R:
+        R.append({"label": "No hidden metadata found — this video looks clean" if rep["readable"]
+                  else "Couldn't read this video format.", "severity": "ok", "detail": ""})
+    has_loc = "GPS location" in rep["leaked"]
+    rep["gdpr"] = ({"personal_data": True, "level": "high",
+                    "verdict": "This video reveals personal data — strip it before posting or sharing.",
+                    "categories": [k for k in ("GPS location", "Date taken") if k in rep["leaked"]],
+                    "advice": "Download the cleaned video below — it's identical but carries no hidden data."}
+                   if has_loc else
+                   {"personal_data": False, "level": "ok" if not rep["leaked"] else "medium",
+                    "verdict": "No location found." if not rep["leaked"] else "Minor device metadata only — low risk.",
+                    "categories": list(rep["leaked"].keys()), "advice": "You can still strip the remaining metadata below."})
+    return rep
+
+def strip_video(contents: bytes, name: str) -> tuple[bytes, str]:
+    import tempfile, subprocess, os
+    ext = "." + name.rsplit(".", 1)[-1]
+    tin = tout = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as f:
+            f.write(contents); tin = f.name
+        tout = tin.rsplit(".", 1)[0] + "_clean" + ext
+        subprocess.run([_ffmpeg_exe(), "-y", "-i", tin, "-map_metadata", "-1",
+                        "-map", "0", "-c", "copy", tout], capture_output=True, timeout=240)
+        with open(tout, "rb") as f:
+            return f.read(), ext.lstrip(".")
+    finally:
+        for p in (tin, tout):
+            if p and os.path.exists(p):
+                try: os.remove(p)
+                except Exception: pass
+
+
 # ── API Routes ────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -3334,16 +3431,21 @@ async def analyze(
 ):
     # Validate file type
     name = file.filename.lower() if file.filename else ""
-    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json", *_IMG_EXT, *_PDF_EXT, *_DOC_EXT]):
-        raise HTTPException(400, "Unsupported file. Please upload .xlsx, .csv, .json, an image, a PDF, or a Word/PowerPoint file.")
+    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json", *_IMG_EXT, *_PDF_EXT, *_DOC_EXT, *_VIDEO_EXT]):
+        raise HTTPException(400, "Unsupported file. Please upload a spreadsheet, image, PDF, Word/PowerPoint, or video.")
 
     contents = await file.read()
 
-    # ── Image / PDF / Word / PowerPoint path: scan footprint only ──
-    if name.endswith(_IMG_EXT) or name.endswith(_PDF_EXT) or name.endswith(_DOC_EXT):
-        if name.endswith(_PDF_EXT):   fp, ft, dt = scan_pdf(contents, name), "pdf", "PDF"
-        elif name.endswith(_DOC_EXT): fp, ft, dt = scan_document(contents, name), "document", ("Word" if name.endswith(".docx") else "PowerPoint")
-        else:                          fp, ft, dt = scan_image(contents, name), "image", "Image"
+    # ── Image / PDF / Word / PowerPoint / Video path: scan footprint only ──
+    if name.endswith(_IMG_EXT) or name.endswith(_PDF_EXT) or name.endswith(_DOC_EXT) or name.endswith(_VIDEO_EXT):
+        if name.endswith(_VIDEO_EXT) and len(contents) > _VIDEO_MAX:
+            fp = {"applicable": True, "kind": "video", "leaked": {}, "risks": [{"label": f"Video is too large ({len(contents)/1024/1024:.0f} MB) — max 250 MB. Try a shorter clip.", "severity": "medium", "detail": ""}],
+                  "score": 100, "details": {}, "categories_present": [], "gdpr": {"personal_data": False, "level": "ok", "verdict": "File too large to scan here.", "categories": [], "advice": ""}}
+            ft, dt = "video", "Video"
+        elif name.endswith(_PDF_EXT):   fp, ft, dt = scan_pdf(contents, name), "pdf", "PDF"
+        elif name.endswith(_DOC_EXT):   fp, ft, dt = scan_document(contents, name), "document", ("Word" if name.endswith(".docx") else "PowerPoint")
+        elif name.endswith(_VIDEO_EXT): fp, ft, dt = scan_video(contents, name), "video", "Video"
+        else:                            fp, ft, dt = scan_image(contents, name), "image", "Image"
         return {
             "file": file.filename, "file_type": ft, "currency": "$",
             "footprint": fp, "result": {}, "metadata": [], "health": None, "summary": [],
@@ -3734,6 +3836,19 @@ async def scrub(
             raise HTTPException(500, f"Could not clean document: {str(e)}")
         base = (file.filename or "document").rsplit(".", 1)[0]
         return StreamingResponse(io.BytesIO(clean), media_type=_MEDIA.get("." + ext, "application/octet-stream"),
+            headers={"Content-Disposition": f'attachment; filename="{base}_cleaned.{ext}"'})
+
+    # ── Video path: strip metadata with ffmpeg (no re-encode) ──
+    if name.endswith(_VIDEO_EXT):
+        contents = await file.read()
+        if len(contents) > _VIDEO_MAX:
+            raise HTTPException(400, "Video too large (max 250 MB).")
+        try:
+            clean, ext = strip_video(contents, name)
+        except Exception as e:
+            raise HTTPException(500, f"Could not clean video: {str(e)}")
+        base = (file.filename or "video").rsplit(".", 1)[0]
+        return StreamingResponse(io.BytesIO(clean), media_type=f"video/{'mp4' if ext in ('mp4','m4v','mov') else ext}",
             headers={"Content-Disposition": f'attachment; filename="{base}_cleaned.{ext}"'})
 
     if not name.endswith(".xlsx"):

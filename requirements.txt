@@ -10,3 +10,5 @@ Pillow
 piexif
 pillow-heif
 pypdf
+hachoir
+imageio-ffmpeg
