@@ -2616,6 +2616,31 @@ def scan_footprint(contents: bytes, name: str, df: pd.DataFrame | None = None) -
     rep["score"] = max(0, min(100, s))
     if not R:
         R.append({"label": "No hidden footprint found — safe to share", "severity": "ok", "detail": ""})
+
+    # ── GDPR "safe to share" verdict (plain English) ──
+    pii = rep.get("pii") or {}
+    direct = [k for k in pii if k in ("Name", "Email", "Phone", "Address", "Date of birth",
+                                      "IBAN", "Aadhaar", "PAN (India)", "US SSN", "UK NINO", "Credit card", "VAT")]
+    if direct:
+        rep["gdpr"] = {
+            "personal_data": True, "level": "high",
+            "verdict": "This file contains personal data — under GDPR, anonymise or get consent before sharing it.",
+            "categories": list(pii.keys()),
+            "advice": "Remove or mask the personal columns below before you send this file externally.",
+        }
+    elif pii:
+        rep["gdpr"] = {
+            "personal_data": True, "level": "medium",
+            "verdict": "This file may contain personal data — review before sharing.",
+            "categories": list(pii.keys()),
+            "advice": "Check the flagged columns and remove anything that identifies a person.",
+        }
+    else:
+        rep["gdpr"] = {
+            "personal_data": False, "level": "ok",
+            "verdict": "No obvious personal data detected — likely safe to share.",
+            "categories": [], "advice": "Still review hidden sheets/author info below before sending.",
+        }
     return rep
 
 
@@ -3185,17 +3210,33 @@ def _mask_pii(s: str) -> str:
 @app.post("/scrub")
 async def scrub(
     file: UploadFile = File(...),
-    identity: bool = Form(True),       # wipe author / company / dates
-    hidden_sheets: bool = Form(True),  # remove hidden sheets
-    comments: bool = Form(True),       # strip cell comments
-    unhide: bool = Form(True),         # unhide rows / columns
-    redact_pii: bool = Form(False),    # mask emails / phones / IDs in cells
+    identity: bool = Form(True),         # wipe author / company / dates
+    hidden_sheets: bool = Form(True),    # remove hidden sheets
+    comments: bool = Form(True),         # strip cell comments
+    unhide: bool = Form(True),           # unhide rows / columns
+    redact_pii: bool = Form(False),      # mask emails / phones / IDs in cells
+    remove_columns: str = Form(default=""),  # JSON list of column headers to delete entirely (manual)
+    remove_words: str = Form(default=""),    # JSON list of words → blank any cell containing them (manual)
 ):
-    """Return a privacy-clean copy, applying ONLY the options the user selected."""
+    """Return a privacy-clean copy, applying ONLY the options the user selected —
+    machine-detected items (identity/hidden/comments/PII) PLUS the client's own
+    manual picks (remove whole columns, blank cells containing chosen words)."""
     name = file.filename.lower() if file.filename else ""
     if not name.endswith(".xlsx"):
         raise HTTPException(400, "Footprint cleaning is for Excel .xlsx files.")
     contents = await file.read()
+    try:
+        rm_cols = json.loads(remove_columns) if remove_columns else []
+        if not isinstance(rm_cols, list): rm_cols = []
+    except Exception:
+        rm_cols = []
+    try:
+        rm_words = json.loads(remove_words) if remove_words else []
+        if not isinstance(rm_words, list): rm_words = []
+    except Exception:
+        rm_words = []
+    rm_cols_l = [str(c).strip().lower() for c in rm_cols if str(c).strip()]
+    rm_words_l = [str(w).strip().lower() for w in rm_words if str(w).strip()]
     try:
         wb = openpyxl.load_workbook(io.BytesIO(contents))
         if identity:
@@ -3207,23 +3248,41 @@ async def scrub(
             for ws in list(wb.worksheets):
                 if ws.sheet_state != "visible" and len(wb.worksheets) > 1:
                     wb.remove(ws)
-        if comments or unhide or redact_pii:
+        # ── Manual: delete whole columns by header (search first 5 rows for the name) ──
+        if rm_cols_l:
+            for ws in wb.worksheets:
+                try:
+                    hits = []
+                    for r in range(1, min(6, ws.max_row + 1)):
+                        for c in range(1, ws.max_column + 1):
+                            v = ws.cell(r, c).value
+                            if v is not None and str(v).strip().lower() in rm_cols_l:
+                                hits.append(c)
+                        if hits: break
+                    for idx in sorted(set(hits), reverse=True):
+                        ws.delete_cols(idx, 1)
+                except Exception:
+                    continue
+        if comments or unhide or redact_pii or rm_words_l:
             cells = 0
             for ws in wb.worksheets:
                 try:
                     if unhide:
                         for d in ws.column_dimensions.values(): d.hidden = False
                         for d in ws.row_dimensions.values():    d.hidden = False
-                    if comments or redact_pii:
+                    if comments or redact_pii or rm_words_l:
                         for row in ws.iter_rows():
                             for cell in row:
                                 cells += 1
                                 if comments and cell.comment:
                                     cell.comment = None
-                                if redact_pii and isinstance(cell.value, str):
-                                    masked = _mask_pii(cell.value)
-                                    if masked != cell.value:
-                                        cell.value = masked
+                                if isinstance(cell.value, str):
+                                    if rm_words_l and any(w in cell.value.lower() for w in rm_words_l):
+                                        cell.value = ""
+                                    elif redact_pii:
+                                        masked = _mask_pii(cell.value)
+                                        if masked != cell.value:
+                                            cell.value = masked
                             if cells > 100000: break
                         if cells > 100000: break
                 except Exception:
