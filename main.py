@@ -3780,6 +3780,18 @@ def _mask_pii(s: str) -> str:
     return s
 
 
+def _pseudonym(label: str, n: int) -> str:
+    """A consistent fake value for a real one — keeps the data usable (same input
+    always maps to the same token, distinct values stay distinct) but anonymous."""
+    l = (label or "").lower()
+    if "email" in l:  return f"user{n}@example.com"
+    if "phone" in l:  return f"+10000{n:06d}"
+    if "name" in l:   return f"Person {n}"
+    if "iban" in l or "account" in l: return f"ACCT{n:08d}"
+    if "card" in l:   return f"4000-0000-0000-{n:04d}"
+    return f"{(label or 'ID').replace(' ', '')}-{n:04d}"
+
+
 @app.post("/scrub")
 async def scrub(
     file: UploadFile = File(...),
@@ -3791,6 +3803,7 @@ async def scrub(
     remove_columns: str = Form(default=""),  # JSON list of column headers to delete entirely (manual)
     remove_words: str = Form(default=""),    # JSON list of words → blank any cell containing them (manual)
     strip_categories: str = Form(default=""),  # images: JSON list subset of {gps,camera,owner,date}; empty = all
+    anonymize: bool = Form(False),       # spreadsheets: replace PII with consistent fake IDs (keeps data usable)
 ):
     """Return a privacy-clean copy, applying ONLY the options the user selected —
     machine-detected items (identity/hidden/comments/PII) PLUS the client's own
@@ -3892,6 +3905,39 @@ async def scrub(
                         ws.delete_cols(idx, 1)
                 except Exception:
                     continue
+        # ── Anonymize: replace PII column values with consistent fake IDs ──
+        if anonymize:
+            try:
+                df_a, _f, _s, _su, _c = _read_and_clean(contents, name)
+                pii = scan_pii(df_a)            # {label: [columns]}
+                col_label = {}
+                for label, cols in pii.items():
+                    for c in cols:
+                        col_label[str(c).strip().lower()] = label
+                if col_label:
+                    for ws in wb.worksheets:
+                        hdr = None
+                        for r in range(1, min(6, ws.max_row + 1)):
+                            vals = [str(ws.cell(r, c).value).strip().lower() if ws.cell(r, c).value is not None else "" for c in range(1, ws.max_column + 1)]
+                            if any(v in col_label for v in vals):
+                                hdr = r; break
+                        if not hdr:
+                            continue
+                        targets = {c: col_label[str(ws.cell(hdr, c).value).strip().lower()]
+                                   for c in range(1, ws.max_column + 1)
+                                   if ws.cell(hdr, c).value is not None and str(ws.cell(hdr, c).value).strip().lower() in col_label}
+                        maps = {c: {} for c in targets}
+                        for r in range(hdr + 1, ws.max_row + 1):
+                            for c, label in targets.items():
+                                v = ws.cell(r, c).value
+                                if v is None or str(v).strip() == "":
+                                    continue
+                                m = maps[c]; key = str(v)
+                                if key not in m:
+                                    m[key] = _pseudonym(label, len(m) + 1)
+                                ws.cell(r, c).value = m[key]
+            except Exception:
+                pass
         if comments or unhide or redact_pii or rm_words_l:
             cells = 0
             for ws in wb.worksheets:
