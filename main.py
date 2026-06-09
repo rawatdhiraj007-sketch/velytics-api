@@ -1059,8 +1059,49 @@ def analyze_auto(df: pd.DataFrame, profile: list[dict],
 # (the universal base always ran first, so nothing ever breaks).
 # ════════════════════════════════════════════════════════════════════════════
 
+# Synonym / translation table — when a pack asks for a concept, _col ALSO tries
+# these equivalents (abbreviations + EU/Latin languages) so engines capture as
+# many real-world column names as possible. Kept to true equivalents to avoid
+# false matches; the pack's explicit keyword always has priority.
+_SYN = {
+    "revenue":    ["umsatz", "turnover", "ventas", "ingresos", "receita", "fatturato", "chiffre", "net sales", "gross sales"],
+    "sales":      ["verkauf", "ventas", "vendas", "vendite"],
+    "amount":     ["betrag", "montant", "importe", "importo", "montante"],
+    "total":      ["gesamt", "totale", "suma"],
+    "quantity":   ["menge", "cantidad", "quantité", "quantidade", "stück", "qté", "no. of units"],
+    "units":      ["einheiten", "unidades", "unità"],
+    "price":      ["preis", "precio", "prix", "prezzo", "preço"],
+    "cost":       ["kosten", "costo", "coût", "custo", "cogs"],
+    "profit":     ["gewinn", "beneficio", "bénéfice", "profitto", "lucro"],
+    "budget":     ["haushalt", "presupuesto"],
+    "target":     ["ziel", "objetivo", "objectif", "obiettivo", "meta", "quota", "goal"],
+    "discount":   ["rabatt", "descuento", "remise", "sconto", "desconto", "markdown"],
+    "date":       ["datum", "fecha", "data", "dato", "tarih"],
+    "customer":   ["kunde", "kunden", "cliente", "clientes", "client", "buyer"],
+    "product":    ["produkt", "producto", "artikel", "articolo", "produto", "prodotto"],
+    "category":   ["kategorie", "categoria", "catégorie", "categoría"],
+    "region":     ["gebiet", "région", "regione", "região", "territory", "zone"],
+    "city":       ["stadt", "ciudad", "ville", "città", "cidade"],
+    "country":    ["land", "pays", "país", "paese"],
+    "salesperson":["verkäufer", "vendeur", "vendedor", "venditore"],
+    "supplier":   ["lieferant", "proveedor", "fournisseur", "fornitore", "vendor"],
+    "vendor":     ["lieferant", "proveedor", "fournisseur", "fornitore", "supplier", "payee"],
+    "warehouse":  ["lager", "almacén", "entrepôt", "magazzino", "godown", "depot"],
+    "department": ["abteilung", "département", "departamento", "reparto", "dept", "division"],
+    "employee":   ["mitarbeiter", "empleado", "employé", "dipendente", "personnel"],
+    "salary":     ["gehalt", "salario", "salaire", "stipendio", "wage", "ctc", "compensation"],
+    "stock":      ["bestand", "existencias"],
+    "channel":    ["kanal", "canal", "canale", "marketplace"],
+    "rating":     ["bewertung", "valoración", "valutazione", "csat"],
+}
+
 def _col(profile, *keywords, role=None):
+    # expand each requested keyword with its known equivalents (priority preserved)
+    expanded = []
     for kw in keywords:
+        expanded.append(kw)
+        expanded.extend(_SYN.get(kw, []))
+    for kw in expanded:
         for p in profile:
             if kw in str(p["column"]).lower() and (role is None or p["role"] == role):
                 return p["column"]
