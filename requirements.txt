@@ -9,3 +9,4 @@ statsmodels==0.14.2
 Pillow
 piexif
 pillow-heif
+pypdf

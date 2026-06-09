@@ -2835,6 +2835,138 @@ def strip_image(contents: bytes, name: str = "", categories=None) -> tuple[bytes
     return out.read(), save_fmt
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# PDF METADATA — author, producer/software, dates + hidden content (JavaScript,
+# attachments, forms, annotations) and the big one: REDACTION FAILURES (text
+# "blacked out" but still readable underneath).
+# ════════════════════════════════════════════════════════════════════════════
+_PDF_EXT = (".pdf",)
+
+def scan_pdf(contents: bytes, name: str) -> dict:
+    rep = {"applicable": True, "kind": "pdf", "leaked": {}, "risks": [], "pii": {},
+           "score": 100, "details": {}, "readable": True, "_flags": {}}
+    try:
+        from pypdf import PdfReader
+        r = PdfReader(io.BytesIO(contents))
+        meta = r.metadata or {}
+        def m(k):
+            v = meta.get(k); return str(v).strip() if v else ""
+        if m("/Author"):   rep["leaked"]["Author"] = m("/Author")
+        if m("/Creator"):  rep["leaked"]["Created with"] = m("/Creator")
+        if m("/Producer"): rep["leaked"]["Producer (software)"] = m("/Producer")
+        if m("/Title"):    rep["leaked"]["Title"] = m("/Title")
+        if m("/Subject"):  rep["leaked"]["Subject"] = m("/Subject")
+        if m("/Keywords"): rep["leaked"]["Keywords"] = m("/Keywords")
+        if meta.get("/CreationDate"): rep["leaked"]["Created"] = str(meta.get("/CreationDate"))
+        if meta.get("/ModDate"):      rep["leaked"]["Modified"] = str(meta.get("/ModDate"))
+
+        det = rep["details"]; det["Pages"] = len(r.pages)
+        has_js = False
+        try:
+            root = r.trailer["/Root"]
+            names = root.get("/Names")
+            if names and "/JavaScript" in names: has_js = True
+            if "/OpenAction" in root or "/AA" in root: has_js = True
+        except Exception:
+            pass
+        attach = 0
+        try:
+            ef = (r.trailer["/Root"].get("/Names") or {}).get("/EmbeddedFiles")
+            if ef and ef.get("/Names"): attach = len(ef["/Names"]) // 2
+        except Exception:
+            pass
+        forms = 0
+        try:
+            acro = r.trailer["/Root"].get("/AcroForm")
+            if acro and acro.get("/Fields"): forms = len(acro["/Fields"])
+        except Exception:
+            pass
+        annots = redact = blackbox = 0
+        for p in r.pages:
+            try:
+                for a in (p.get("/Annots") or []):
+                    o = a.get_object(); annots += 1
+                    st = str(o.get("/Subtype"))
+                    if st == "/Redact": redact += 1
+                    elif st in ("/Square", "/Redaction"):
+                        ic = o.get("/IC")
+                        if ic and all(float(x) < 0.25 for x in ic): blackbox += 1
+            except Exception:
+                continue
+        text = ""
+        try:
+            text = "".join((pg.extract_text() or "") for pg in r.pages[:5])
+        except Exception:
+            pass
+        det["Has JavaScript"] = "Yes" if has_js else "No"
+        if attach: det["Attachments"] = attach
+        if forms:  det["Form fields"] = forms
+        if annots: det["Annotations / comments"] = annots
+        det["Text copyable"] = "Yes" if len(text.strip()) > 20 else "No (scanned/secured)"
+        rep["_flags"] = {"js": has_js, "attach": attach, "forms": forms, "annots": annots,
+                         "redact": redact, "blackbox": blackbox, "has_text": len(text.strip()) > 20}
+    except Exception:
+        rep["readable"] = False
+
+    s, R = 100, rep["risks"]; f = rep["_flags"]
+    ids = [rep["leaked"][k] for k in ("Author", "Created with", "Producer (software)") if k in rep["leaked"]]
+    if ids:
+        s -= 15; R.append({"label": f"Reveals identity / software: {', '.join(ids)[:80]}", "severity": "high", "cat": "metadata",
+                           "detail": "Author and the software used are embedded — can leak names, usernames, internal tools."})
+    if f.get("redact"):
+        s -= 40; R.append({"label": f"{f['redact']} UNAPPLIED redaction(s) — blacked-out text is still readable", "severity": "high", "cat": "redaction",
+                           "detail": "Redactions were marked but never applied — the hidden text can be copied out."})
+    if f.get("blackbox") and f.get("has_text"):
+        s -= 30; R.append({"label": "Black boxes over text, but the text is still copyable underneath", "severity": "high", "cat": "redaction",
+                           "detail": "Drawing a black box does NOT remove the text — it's still in the file."})
+    if f.get("js"):
+        s -= 20; R.append({"label": "Contains JavaScript / auto-actions", "severity": "high", "cat": "js",
+                           "detail": "Embedded scripts can run when the PDF is opened."})
+    if f.get("attach"):
+        s -= 10; R.append({"label": f"{f['attach']} embedded file attachment(s)", "severity": "medium", "cat": "attachments",
+                           "detail": "Files hidden inside the PDF travel with it."})
+    if f.get("annots"):
+        s -= 8; R.append({"label": f"{f['annots']} annotation(s) / comment(s)", "severity": "medium", "cat": "annotations",
+                          "detail": "Notes and markups may contain private remarks."})
+    if f.get("forms"):
+        s -= 5; R.append({"label": f"{f['forms']} form field(s) with possible saved data", "severity": "low", "cat": "metadata",
+                          "detail": "Form fields can hold previously entered data."})
+    rep["score"] = max(0, min(100, s))
+    rep["categories_present"] = sorted({r2.get("cat") for r2 in R if r2.get("cat")})
+    if not R:
+        R.append({"label": "No hidden data found — this PDF looks safe to share" if rep["readable"]
+                  else "Couldn't read this PDF (it may be encrypted).", "severity": "ok", "detail": ""})
+    has_redact = bool(f.get("redact") or (f.get("blackbox") and f.get("has_text")))
+    rep["gdpr"] = ({"personal_data": True, "level": "high",
+                    "verdict": "This PDF may expose data that was meant to be hidden — review before sharing.",
+                    "categories": [k for k in ("Author",) if k in rep["leaked"]] + (["Failed redaction"] if has_redact else []),
+                    "advice": "Clean it below to strip metadata, scripts and attachments. NOTE: failed-redaction text can't be auto-fixed — re-do the redaction in your PDF editor."}
+                   if (ids or has_redact or f.get("js")) else
+                   {"personal_data": bool(ids), "level": "ok" if not (ids or rep["leaked"]) else "medium",
+                    "verdict": "No major exposure found." if not rep["leaked"] else "Only document info found — low risk.",
+                    "categories": list(rep["leaked"].keys()), "advice": "You can still strip the metadata below."})
+    return rep
+
+def clean_pdf(contents: bytes) -> bytes:
+    """Strip metadata + drop document-level JavaScript/attachments/forms (a fresh
+    writer doesn't carry them) + remove page annotations. NOTE: cannot fix amateur
+    black-box redaction — that text lives in the page content itself."""
+    from pypdf import PdfReader, PdfWriter
+    r = PdfReader(io.BytesIO(contents)); w = PdfWriter()
+    for p in r.pages:
+        try:
+            if "/Annots" in p: del p["/Annots"]
+        except Exception:
+            pass
+        w.add_page(p)
+    try:
+        w.add_metadata({"/Author": "", "/Creator": "", "/Producer": "", "/Title": "", "/Subject": "", "/Keywords": ""})
+    except Exception:
+        pass
+    out = io.BytesIO(); w.write(out); out.seek(0)
+    return out.read()
+
+
 # ── API Routes ────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -3069,21 +3201,22 @@ async def analyze(
 ):
     # Validate file type
     name = file.filename.lower() if file.filename else ""
-    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json", *_IMG_EXT]):
-        raise HTTPException(400, "Unsupported file. Please upload .xlsx, .csv, .json or an image.")
+    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json", *_IMG_EXT, *_PDF_EXT]):
+        raise HTTPException(400, "Unsupported file. Please upload .xlsx, .csv, .json, an image or a PDF.")
 
     contents = await file.read()
 
-    # ── Image / photo path: scan EXIF footprint only (no dataframe analysis) ──
-    if name.endswith(_IMG_EXT):
-        fp = scan_image(contents, name)
+    # ── Image / PDF path: scan footprint only (no dataframe analysis) ──
+    if name.endswith(_IMG_EXT) or name.endswith(_PDF_EXT):
+        is_pdf = name.endswith(_PDF_EXT)
+        fp = scan_pdf(contents, name) if is_pdf else scan_image(contents, name)
         return {
-            "file": file.filename, "file_type": "image", "currency": "$",
+            "file": file.filename, "file_type": "pdf" if is_pdf else "image", "currency": "$",
             "footprint": fp, "result": {}, "metadata": [], "health": None, "summary": [],
             "fixes": [], "filter_schema": [], "dimensions": [], "measures": [],
             "applied_filters": {}, "applied_edits": 0, "raw_blanks": 0, "blanks_mode": "leave",
             "preview": [], "rows": 0, "total_rows": 0, "columns": 0, "sheets": [], "sheet_used": "",
-            "detected_type": "Image",
+            "detected_type": "PDF" if is_pdf else "Image",
         }
 
     try:
@@ -3445,6 +3578,17 @@ async def scrub(
         media = "image/jpeg" if fmt == "JPEG" else f"image/{ext}"
         return StreamingResponse(io.BytesIO(clean), media_type=media,
             headers={"Content-Disposition": f'attachment; filename="{base}_cleaned.{ext}"'})
+
+    # ── PDF path: strip metadata + scripts/attachments + annotations ──
+    if name.endswith(_PDF_EXT):
+        contents = await file.read()
+        try:
+            clean = clean_pdf(contents)
+        except Exception as e:
+            raise HTTPException(500, f"Could not clean PDF: {str(e)}")
+        base = (file.filename or "document").rsplit(".", 1)[0]
+        return StreamingResponse(io.BytesIO(clean), media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{base}_cleaned.pdf"'})
 
     if not name.endswith(".xlsx"):
         raise HTTPException(400, "Footprint cleaning is for Excel .xlsx files.")
