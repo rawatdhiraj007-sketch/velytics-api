@@ -2967,6 +2967,139 @@ def clean_pdf(contents: bytes) -> bytes:
     return out.read()
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# WORD / POWERPOINT METADATA — .docx/.pptx are ZIP+XML, so we read the hidden
+# document properties (author, company, edit history, template/username path)
+# and content (comments, tracked changes, speaker notes, hidden slides) with no
+# extra libraries. Same find → report → clean model.
+# ════════════════════════════════════════════════════════════════════════════
+_DOC_EXT = (".docx", ".pptx")
+_MEDIA = {".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"}
+
+def scan_document(contents: bytes, name: str) -> dict:
+    import zipfile, xml.etree.ElementTree as ET
+    rep = {"applicable": True, "kind": "document", "leaked": {}, "risks": [], "pii": {},
+           "score": 100, "details": {}, "readable": True, "_flags": {}}
+    loc = lambda t: t.split("}")[-1]
+    is_word = name.endswith(".docx"); is_ppt = name.endswith(".pptx")
+    try:
+        z = zipfile.ZipFile(io.BytesIO(contents)); names = set(z.namelist())
+        core, app = {}, {}
+        if "docProps/core.xml" in names:
+            for el in ET.fromstring(z.read("docProps/core.xml")):
+                core[loc(el.tag)] = (el.text or "").strip()
+        if "docProps/app.xml" in names:
+            for el in ET.fromstring(z.read("docProps/app.xml")):
+                app[loc(el.tag)] = (el.text or "").strip()
+        L = rep["leaked"]
+        if core.get("creator"):        L["Author"] = core["creator"]
+        if core.get("lastModifiedBy"): L["Last modified by"] = core["lastModifiedBy"]
+        if app.get("Company"):         L["Company"] = app["Company"]
+        if app.get("Manager"):         L["Manager"] = app["Manager"]
+        if core.get("title"):          L["Title"] = core["title"]
+        if core.get("subject"):        L["Subject"] = core["subject"]
+        if core.get("keywords"):       L["Keywords"] = core["keywords"]
+        if core.get("created"):        L["Created"] = core["created"]
+        if core.get("modified"):       L["Modified"] = core["modified"]
+        det = rep["details"]
+        if app.get("Application"): det["Created with"] = (app["Application"] + " " + app.get("AppVersion", "")).strip()
+        if core.get("revision"):  det["Revisions"] = core["revision"]
+        if app.get("TotalTime") and app["TotalTime"] != "0": det["Total edit time"] = app["TotalTime"] + " min"
+        if app.get("Template") and app["Template"].lower() not in ("normal.dotm", "normal", ""): det["Template"] = app["Template"]
+        for k in ("Words", "Slides", "Pages", "Paragraphs"):
+            if app.get(k): det[k] = app[k]
+        f = rep["_flags"]
+        if is_word:
+            f["comments"] = 1 if "word/comments.xml" in names else 0
+            try:
+                doc = z.read("word/document.xml").decode("utf-8", "ignore")
+                f["tracked"] = ("<w:ins" in doc or "<w:del" in doc)
+                f["hidden_text"] = ("<w:vanish" in doc)
+            except Exception:
+                pass
+        if is_ppt:
+            f["comments"] = sum(1 for n in names if n.startswith("ppt/comments/") and n.endswith(".xml"))
+            f["notes"] = sum(1 for n in names if n.startswith("ppt/notesSlides/notesSlide"))
+            try:
+                hidden = 0
+                for n in names:
+                    if n.startswith("ppt/slides/slide") and n.endswith(".xml"):
+                        if 'show="0"' in z.read(n).decode("utf-8", "ignore")[:400]:
+                            hidden += 1
+                f["hidden_slides"] = hidden
+            except Exception:
+                pass
+    except Exception:
+        rep["readable"] = False
+
+    s, R, f = 100, rep["risks"], rep["_flags"]
+    ids = [rep["leaked"][k] for k in ("Author", "Last modified by", "Company", "Manager") if k in rep["leaked"]]
+    if ids:
+        s -= 15; R.append({"label": f"Reveals identity: {', '.join(ids)[:80]}", "severity": "high", "cat": "metadata",
+                           "detail": "Author / editor / company name is embedded in the file."})
+    tpl = rep["details"].get("Template", "")
+    if "\\users\\" in tpl.lower() or ":\\" in tpl.lower():
+        s -= 10; R.append({"label": f"File path leaks a username: {tpl}", "severity": "high", "cat": "metadata",
+                           "detail": "The template path reveals a person's name / computer."})
+    if f.get("tracked"):
+        s -= 20; R.append({"label": "Tracked changes present — deleted text is recoverable", "severity": "high", "cat": "comments",
+                           "detail": "Accept/reject all changes in your editor before sharing."})
+    if f.get("comments"):
+        s -= 12; R.append({"label": f"{f['comments']} comment thread(s) / note(s)", "severity": "medium", "cat": "comments",
+                           "detail": "Internal review comments travel with the file."})
+    if f.get("notes"):
+        s -= 10; R.append({"label": f"{f['notes']} slide(s) with speaker notes", "severity": "medium", "cat": "comments",
+                           "detail": "Speaker notes are often private remarks."})
+    if f.get("hidden_slides"):
+        s -= 12; R.append({"label": f"{f['hidden_slides']} hidden slide(s)", "severity": "high", "cat": "metadata",
+                           "detail": "Hidden slides still travel inside the file."})
+    if f.get("hidden_text"):
+        s -= 8; R.append({"label": "Hidden text detected", "severity": "medium", "cat": "metadata",
+                          "detail": "Text formatted as hidden is still in the file."})
+    rep["score"] = max(0, min(100, s))
+    rep["categories_present"] = sorted({r2.get("cat") for r2 in R if r2.get("cat")})
+    if not R:
+        R.append({"label": "No hidden data found — safe to share" if rep["readable"]
+                  else "Couldn't read this document.", "severity": "ok", "detail": ""})
+    rep["gdpr"] = ({"personal_data": True, "level": "high",
+                    "verdict": "This document carries hidden author/edit data — clean it before sharing.",
+                    "categories": [k for k in ("Author", "Company") if k in rep["leaked"]],
+                    "advice": "Download the cleaned copy to strip author/company/edit history. Tracked changes & comments are flagged — clear those in your editor too."}
+                   if ids or f.get("tracked") or f.get("comments") else
+                   {"personal_data": bool(ids), "level": "ok" if not rep["leaked"] else "medium",
+                    "verdict": "No major exposure found." if not rep["leaked"] else "Only document info found — low risk.",
+                    "categories": list(rep["leaked"].keys()), "advice": "You can still strip the metadata below."})
+    return rep
+
+def clean_document(contents: bytes, name: str) -> bytes:
+    """Strip document properties (author/company/edit history) reliably by
+    replacing core.xml/app.xml with empty ones. (Comments/tracked-changes are
+    flagged for the user to clear in their editor — removing them safely needs
+    rel/content-type surgery we don't risk corrupting the file with.)"""
+    import zipfile
+    CORE = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties"'
+            ' xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/"'
+            ' xmlns:dcmitype="http://purl.org/dc/dcmitype/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+            '<dc:creator></dc:creator><cp:lastModifiedBy></cp:lastModifiedBy></cp:coreProperties>')
+    z_in = zipfile.ZipFile(io.BytesIO(contents)); out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zo:
+        for item in z_in.infolist():
+            n = item.filename
+            if n == "docProps/core.xml":
+                zo.writestr(n, CORE)
+            elif n == "docProps/app.xml":
+                data = z_in.read(n).decode("utf-8", "ignore")
+                # blank the identity-bearing fields, keep the file structure valid
+                for tag in ("Company", "Manager", "Template"):
+                    data = re.sub(rf"<{tag}>.*?</{tag}>", f"<{tag}></{tag}>", data, flags=re.S)
+                zo.writestr(n, data)
+            else:
+                zo.writestr(item, z_in.read(n))
+    out.seek(0); return out.read()
+
+
 # ── API Routes ────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -3201,22 +3334,23 @@ async def analyze(
 ):
     # Validate file type
     name = file.filename.lower() if file.filename else ""
-    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json", *_IMG_EXT, *_PDF_EXT]):
-        raise HTTPException(400, "Unsupported file. Please upload .xlsx, .csv, .json, an image or a PDF.")
+    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json", *_IMG_EXT, *_PDF_EXT, *_DOC_EXT]):
+        raise HTTPException(400, "Unsupported file. Please upload .xlsx, .csv, .json, an image, a PDF, or a Word/PowerPoint file.")
 
     contents = await file.read()
 
-    # ── Image / PDF path: scan footprint only (no dataframe analysis) ──
-    if name.endswith(_IMG_EXT) or name.endswith(_PDF_EXT):
-        is_pdf = name.endswith(_PDF_EXT)
-        fp = scan_pdf(contents, name) if is_pdf else scan_image(contents, name)
+    # ── Image / PDF / Word / PowerPoint path: scan footprint only ──
+    if name.endswith(_IMG_EXT) or name.endswith(_PDF_EXT) or name.endswith(_DOC_EXT):
+        if name.endswith(_PDF_EXT):   fp, ft, dt = scan_pdf(contents, name), "pdf", "PDF"
+        elif name.endswith(_DOC_EXT): fp, ft, dt = scan_document(contents, name), "document", ("Word" if name.endswith(".docx") else "PowerPoint")
+        else:                          fp, ft, dt = scan_image(contents, name), "image", "Image"
         return {
-            "file": file.filename, "file_type": "pdf" if is_pdf else "image", "currency": "$",
+            "file": file.filename, "file_type": ft, "currency": "$",
             "footprint": fp, "result": {}, "metadata": [], "health": None, "summary": [],
             "fixes": [], "filter_schema": [], "dimensions": [], "measures": [],
             "applied_filters": {}, "applied_edits": 0, "raw_blanks": 0, "blanks_mode": "leave",
             "preview": [], "rows": 0, "total_rows": 0, "columns": 0, "sheets": [], "sheet_used": "",
-            "detected_type": "PDF" if is_pdf else "Image",
+            "detected_type": dt,
         }
 
     try:
@@ -3589,6 +3723,18 @@ async def scrub(
         base = (file.filename or "document").rsplit(".", 1)[0]
         return StreamingResponse(io.BytesIO(clean), media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="{base}_cleaned.pdf"'})
+
+    # ── Word / PowerPoint path: strip document properties ──
+    if name.endswith(_DOC_EXT):
+        contents = await file.read()
+        ext = name.rsplit(".", 1)[-1]
+        try:
+            clean = clean_document(contents, name)
+        except Exception as e:
+            raise HTTPException(500, f"Could not clean document: {str(e)}")
+        base = (file.filename or "document").rsplit(".", 1)[0]
+        return StreamingResponse(io.BytesIO(clean), media_type=_MEDIA.get("." + ext, "application/octet-stream"),
+            headers={"Content-Disposition": f'attachment; filename="{base}_cleaned.{ext}"'})
 
     if not name.endswith(".xlsx"):
         raise HTTPException(400, "Footprint cleaning is for Excel .xlsx files.")
