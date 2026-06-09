@@ -3197,6 +3197,133 @@ def strip_video(contents: bytes, name: str) -> tuple[bytes, str]:
                 except Exception: pass
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# EMAIL METADATA — .eml/.msg headers are the ONE place IP addresses really live.
+# Received headers reveal the sender/server IPs (≈ location); Bcc exposes hidden
+# recipients; X-Mailer reveals the software. Scan + strip to a clean .eml.
+# ════════════════════════════════════════════════════════════════════════════
+_EMAIL_EXT = (".eml", ".msg")
+
+def _email_extract(contents: bytes, name: str):
+    """Return (fields dict, received headers, x-originating headers, client)."""
+    From = To = Cc = Bcc = Subject = Date = client = ""
+    received, xorig = [], []
+    if name.endswith(".eml"):
+        import email
+        from email import policy
+        m = email.message_from_bytes(contents, policy=policy.default)
+        g = lambda k: (str(m[k]) if m[k] else "")
+        From, To, Cc, Bcc, Subject, Date = g("From"), g("To"), g("Cc"), g("Bcc"), g("Subject"), g("Date")
+        client = g("X-Mailer") or g("User-Agent")
+        received = [str(x) for x in (m.get_all("Received") or [])]
+        xorig = [str(x) for x in (m.get_all("X-Originating-IP") or [])]
+        for k in ("X-Sender-IP", "X-Source-IP", "X-Real-IP"):
+            if m[k]: xorig.append(str(m[k]))
+    else:  # .msg
+        import extract_msg, tempfile, os
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".msg", delete=False) as f:
+                f.write(contents); tmp = f.name
+            em = extract_msg.Message(tmp)
+            From = str(em.sender or ""); To = str(em.to or ""); Cc = str(em.cc or "")
+            Bcc = str(em.bcc or ""); Subject = str(em.subject or ""); Date = str(em.date or "")
+            hdr = em.header
+            if hdr:
+                received = [str(x) for x in (hdr.get_all("Received") or [])]
+                xorig = [str(x) for x in (hdr.get_all("X-Originating-IP") or [])]
+                client = str(hdr.get("X-Mailer") or hdr.get("User-Agent") or "")
+            em.close()
+        finally:
+            if tmp and os.path.exists(tmp):
+                try: os.remove(tmp)
+                except Exception: pass
+    return {"From": From, "To": To, "Cc": Cc, "Bcc": Bcc, "Subject": Subject, "Date": Date}, received, xorig, client
+
+def scan_email(contents: bytes, name: str) -> dict:
+    rep = {"applicable": True, "kind": "email", "leaked": {}, "risks": [], "pii": {},
+           "score": 100, "details": {}, "readable": True}
+    f = {}; received = []; xorig = []; client = ""; ips = set()
+    try:
+        f, received, xorig, client = _email_extract(contents, name)
+        iprx = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+        for h in received + xorig:
+            for ip in iprx.findall(h):
+                if not ip.startswith(("127.", "0.")):
+                    ips.add(ip)
+    except Exception:
+        rep["readable"] = False
+    L = rep["leaked"]
+    if f.get("From"):    L["From"] = f["From"]
+    if f.get("To"):      L["To (recipients)"] = f["To"]
+    if f.get("Cc"):      L["Cc"] = f["Cc"]
+    if f.get("Bcc"):     L["Bcc (hidden recipients)"] = f["Bcc"]
+    if f.get("Subject"): L["Subject"] = f["Subject"]
+    if f.get("Date"):    L["Date"] = f["Date"]
+    if ips:              L["IP addresses"] = ", ".join(sorted(ips)[:6])
+    det = rep["details"]
+    if client:   det["Email client"] = client
+    if received: det["Mail servers (hops)"] = len(received)
+
+    s, R = 100, rep["risks"]
+    if ips:
+        s -= 30; R.append({"label": f"IP address(es) exposed: {', '.join(sorted(ips)[:4])}", "severity": "high", "cat": "ip",
+                           "detail": "Email headers reveal the sender / mail-server IPs — roughly where it came from."})
+    if f.get("Bcc"):
+        s -= 25; R.append({"label": f"Bcc (hidden recipients) exposed: {f['Bcc'][:60]}", "severity": "high", "cat": "recipients",
+                           "detail": "Blind-copied recipients are visible in this saved email."})
+    if f.get("To") or f.get("Cc"):
+        s -= 10; R.append({"label": "Recipient email addresses present", "severity": "medium", "cat": "recipients",
+                           "detail": "To / Cc addresses are personal data."})
+    if client:
+        s -= 5; R.append({"label": f"Email client / software: {client[:50]}", "severity": "low", "cat": "client",
+                          "detail": "Reveals the software used to send."})
+    rep["score"] = max(0, min(100, s))
+    rep["categories_present"] = sorted({r2.get("cat") for r2 in R if r2.get("cat")})
+    if not R:
+        R.append({"label": "No sensitive headers found" if rep["readable"] else "Couldn't read this email file.", "severity": "ok", "detail": ""})
+    rep["gdpr"] = ({"personal_data": True, "level": "high",
+                    "verdict": "This email exposes IPs / recipients — clean the headers before sharing it.",
+                    "categories": [k for k in ("IP addresses", "Bcc (hidden recipients)", "From") if k in L],
+                    "advice": "Download the cleaned .eml — Received / IP / Message-ID / X-* headers and Bcc are removed."}
+                   if (ips or f.get("Bcc") or f.get("From")) else
+                   {"personal_data": False, "level": "ok", "verdict": "No major exposure found.", "categories": [], "advice": ""})
+    return rep
+
+def clean_email(contents: bytes, name: str) -> tuple[bytes, str]:
+    import email
+    from email import policy
+    if name.endswith(".msg"):
+        import extract_msg, tempfile, os
+        from email.message import EmailMessage
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".msg", delete=False) as fobj:
+                fobj.write(contents); tmp = fobj.name
+            em = extract_msg.Message(tmp)
+            nm = EmailMessage()
+            if em.sender:  nm["From"] = str(em.sender)
+            if em.to:      nm["To"] = str(em.to)
+            if em.cc:      nm["Cc"] = str(em.cc)
+            if em.subject: nm["Subject"] = str(em.subject)
+            nm.set_content(str(em.body or ""))
+            em.close()
+            return nm.as_bytes(), "eml"
+        finally:
+            if tmp and os.path.exists(tmp):
+                try: os.remove(tmp)
+                except Exception: pass
+    m = email.message_from_bytes(contents, policy=policy.default)
+    drop = {"received", "x-originating-ip", "x-sender-ip", "x-source-ip", "x-real-ip", "message-id",
+            "x-mailer", "user-agent", "bcc", "return-path", "x-originating-email", "dkim-signature",
+            "authentication-results", "received-spf"}
+    names = {k for k in m.keys() if k.lower() in drop or k.lower().startswith("x-")}
+    for h in names:
+        while h in m:
+            del m[h]
+    return m.as_bytes(), "eml"
+
+
 # ── API Routes ────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -3431,13 +3558,13 @@ async def analyze(
 ):
     # Validate file type
     name = file.filename.lower() if file.filename else ""
-    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json", *_IMG_EXT, *_PDF_EXT, *_DOC_EXT, *_VIDEO_EXT]):
-        raise HTTPException(400, "Unsupported file. Please upload a spreadsheet, image, PDF, Word/PowerPoint, or video.")
+    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json", *_IMG_EXT, *_PDF_EXT, *_DOC_EXT, *_VIDEO_EXT, *_EMAIL_EXT]):
+        raise HTTPException(400, "Unsupported file. Please upload a spreadsheet, image, PDF, Word/PowerPoint, video, or email.")
 
     contents = await file.read()
 
-    # ── Image / PDF / Word / PowerPoint / Video path: scan footprint only ──
-    if name.endswith(_IMG_EXT) or name.endswith(_PDF_EXT) or name.endswith(_DOC_EXT) or name.endswith(_VIDEO_EXT):
+    # ── Image / PDF / Word / PowerPoint / Video / Email path: scan footprint only ──
+    if name.endswith(_IMG_EXT) or name.endswith(_PDF_EXT) or name.endswith(_DOC_EXT) or name.endswith(_VIDEO_EXT) or name.endswith(_EMAIL_EXT):
         if name.endswith(_VIDEO_EXT) and len(contents) > _VIDEO_MAX:
             fp = {"applicable": True, "kind": "video", "leaked": {}, "risks": [{"label": f"Video is too large ({len(contents)/1024/1024:.0f} MB) — max 250 MB. Try a shorter clip.", "severity": "medium", "detail": ""}],
                   "score": 100, "details": {}, "categories_present": [], "gdpr": {"personal_data": False, "level": "ok", "verdict": "File too large to scan here.", "categories": [], "advice": ""}}
@@ -3445,6 +3572,7 @@ async def analyze(
         elif name.endswith(_PDF_EXT):   fp, ft, dt = scan_pdf(contents, name), "pdf", "PDF"
         elif name.endswith(_DOC_EXT):   fp, ft, dt = scan_document(contents, name), "document", ("Word" if name.endswith(".docx") else "PowerPoint")
         elif name.endswith(_VIDEO_EXT): fp, ft, dt = scan_video(contents, name), "video", "Video"
+        elif name.endswith(_EMAIL_EXT): fp, ft, dt = scan_email(contents, name), "email", "Email"
         else:                            fp, ft, dt = scan_image(contents, name), "image", "Image"
         return {
             "file": file.filename, "file_type": ft, "currency": "$",
@@ -3862,6 +3990,17 @@ async def scrub(
             raise HTTPException(500, f"Could not clean video: {str(e)}")
         base = (file.filename or "video").rsplit(".", 1)[0]
         return StreamingResponse(io.BytesIO(clean), media_type=f"video/{'mp4' if ext in ('mp4','m4v','mov') else ext}",
+            headers={"Content-Disposition": f'attachment; filename="{base}_cleaned.{ext}"'})
+
+    # ── Email path: strip technical headers (Received/IP/Message-ID/X-*) + Bcc ──
+    if name.endswith(_EMAIL_EXT):
+        contents = await file.read()
+        try:
+            clean, ext = clean_email(contents, name)
+        except Exception as e:
+            raise HTTPException(500, f"Could not clean email: {str(e)}")
+        base = (file.filename or "email").rsplit(".", 1)[0]
+        return StreamingResponse(io.BytesIO(clean), media_type="message/rfc822",
             headers={"Content-Disposition": f'attachment; filename="{base}_cleaned.{ext}"'})
 
     if not name.endswith(".xlsx"):

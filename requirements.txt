@@ -12,3 +12,4 @@ pillow-heif
 pypdf
 hachoir
 imageio-ffmpeg
+extract-msg
