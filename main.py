@@ -792,12 +792,20 @@ def analyze_generic(df):
 _CURRENCY = "$"
 
 def detect_currency(df_raw: pd.DataFrame) -> str:
-    """Sniff the currency symbol from the raw cells; default to $ (Western)."""
+    """Sniff the currency from raw cells — symbol first, then ISO code / word in
+    headers (e.g. 'Revenue (INR)'); default to $ (Western)."""
     try:
         text = " ".join(df_raw.head(200).astype(str).values.ravel().tolist())
         counts = {s: text.count(s) for s in ["€", "£", "₹", "$"]}
         best = max(counts, key=counts.get)
-        return best if counts[best] > 0 else "$"
+        if counts[best] > 0:
+            return best
+        up = text.upper()
+        codes = [("₹", ["INR", "RUPEE"]), ("€", ["EUR", "EURO"]),
+                 ("£", ["GBP", "STERLING", "POUND"]), ("$", ["USD", "DOLLAR"])]
+        cc = {sym: sum(up.count(w) for w in words) for sym, words in codes}
+        bestc = max(cc, key=cc.get)
+        return bestc if cc[bestc] > 0 else "$"
     except Exception:
         return "$"
 
@@ -828,17 +836,20 @@ def _is_money(name: str) -> bool:
 
 
 def _to_datetime(s: pd.Series):
-    """Parse a series to datetime if it plausibly is one, else None."""
+    """Parse a series to datetime if it plausibly is one, else None. Tries both
+    month-first (US) and day-first (EU/India) and keeps whichever parses more —
+    so 24/09/2024 is understood, not silently dropped."""
     if pd.api.types.is_datetime64_any_dtype(s):
         return s
     nonnull = s.dropna()
     if len(nonnull) == 0 or pd.api.types.is_numeric_dtype(s):
         return None
-    sample = nonnull.astype(str).head(25)
-    parsed = pd.to_datetime(sample, errors="coerce")
-    if parsed.notna().mean() >= 0.8:
-        return pd.to_datetime(s, errors="coerce")
-    return None
+    sample = nonnull.astype(str).head(50)
+    r_mf = pd.to_datetime(sample, errors="coerce").notna().mean()              # month-first
+    r_df = pd.to_datetime(sample, errors="coerce", dayfirst=True).notna().mean()  # day-first
+    if max(r_mf, r_df) < 0.8:
+        return None
+    return pd.to_datetime(s, errors="coerce", dayfirst=(r_df > r_mf))
 
 
 def profile_columns(df: pd.DataFrame) -> list[dict]:
@@ -1614,24 +1625,111 @@ def pack_hr(df, profile):
 
 
 def pack_retail(df, profile):
+    """Best-in-class Retail / e-commerce engine — revenue, channels, returns,
+    discount leakage, new-vs-returning, geography, delivery & ratings."""
     K, S, A = {}, {}, []
-    rev = _col(profile, "revenue", "sales", "amount", "total", role="number")
-    channel = _col(profile, "channel", "source", "platform")
-    cat = _col(profile, "category", "product")
-    returns = _col(profile, "return", "returned", "refund")
-    rating = _col(profile, "rating", "review", role="number")
-    if rev:
-        r = _numv(df, rev); tot = float(r.sum()); _money_kpi(K, "Total Revenue", tot)
-        _money_kpi(K, "Avg Order Value", tot / (int(r.notna().sum()) or 1)); K["Orders"] = int(r.notna().sum())
-        if channel: S["Revenue by channel"] = _sumrows(df, channel, r, 8)
-        if cat: S["Revenue by category"] = _sumrows(df, cat, r, 10)
+    rev      = _col(profile, "revenue", "sales", "amount", "total", "net amount", role="number")
+    qty      = _col(profile, "quantity", "qty", "units", role="number")
+    price    = _col(profile, "unit price", "price", "rate", "mrp", role="number")
+    disc     = _col(profile, "discount", "disc", "markdown", role="number")
+    channel  = _col(profile, "channel", "source", "platform", "marketplace")
+    cat      = _col(profile, "category", "department", "segment")
+    product  = _col(profile, "product", "item", "sku", "article")
+    city     = _col(profile, "city", "location", "region", "state", "store", "zone")
+    pay      = _col(profile, "payment method", "payment", "pay mode", "tender")
+    custtype = _col(profile, "customer type", "customer segment", "new", "returning", "buyer type")
+    returns  = _col(profile, "returned", "return", "refund")
+    rating   = _col(profile, "rating", "review", "csat", "stars", role="number")
+    delivery = _col(profile, "delivery days", "delivery time", "days to deliver", "shipping days", "lead time", role="number")
+    date     = _col(profile, "date", "order date", "invoice date", role="date")
+
+    if not rev:
+        return K, S, A
+    r = _numv(df, rev); tot = float(r.sum()); n = int(r.notna().sum()) or 1
+    _money_kpi(K, "Total Revenue", tot)
+    K["Orders"] = n
+    _money_kpi(K, "Avg Order Value", tot / n)
+    if qty: K["Units Sold"] = int(_numv(df, qty).fillna(0).sum())
+
+    # ── Monthly sales trend (shown first) ──
+    if date:
+        try:
+            t = df[[date]].copy(); t["_d"] = _to_datetime(df[date]); t["_r"] = r
+            t = t.dropna(subset=["_d"])
+            m = t.groupby(t["_d"].dt.to_period("M"))["_r"].sum().sort_index()
+            if len(m) >= 2:
+                S["Monthly revenue"] = [{"month": str(p), "value": round(float(v), 2)} for p, v in m.tail(12).items()]
+        except Exception:
+            pass
+
+    # ── Revenue breakdowns ──
+    if channel:
+        S["Revenue by channel"] = _sumrows(df, channel, r, 8)
+        tc = S["Revenue by channel"]
+        if tc and tc[0]["pct"] >= 50:
+            A.append({"type": "Warning", "text": f"{tc[0]['name']} is {tc[0]['pct']}% of revenue — channel concentration risk."})
+    if cat:     S["Revenue by category"] = _sumrows(df, cat, r, 10)
+    if product: S["Top products"] = _sumrows(df, product, r, 10)
+    if city:    S["Revenue by city"] = _sumrows(df, city, r, 10)
+    if pay:     S["Revenue by payment method"] = _sumrows(df, pay, r, 6)
+
+    # ── Discounts & leakage ──
+    if disc:
+        dv = _numv(df, disc).dropna()
+        if len(dv) and dv.max() <= 100:
+            K["Avg Discount %"] = round(float(dv.mean()), 1)
+            if price and qty:
+                gross = float((_numv(df, price) * _numv(df, qty)).sum())
+                if gross > tot:
+                    _money_kpi(K, "Discount Given", gross - tot)
+            if float(dv.mean()) > 25:
+                A.append({"type": "Warning", "text": f"Avg discount is {round(float(dv.mean()),1)}% — discount leakage eating margin."})
+
+    # ── Returns ──
     if returns:
         low = df[returns].astype(str).str.lower()
-        rc = int(low.str.contains("yes|true|return|1", na=False).sum())
+        retm = low.str.contains(r"\byes\b|\btrue\b|return|refund|^1$", na=False)
+        rc = int(retm.sum())
         if rc:
-            K["Return Rate %"] = _pct(rc, len(df))
-            if _pct(rc, len(df)) > 10: A.append({"type": "Warning", "text": f"Return rate {_pct(rc,len(df))}% — above 10%."})
-    if rating: K["Avg Rating"] = round(float(_numv(df, rating).mean()), 1)
+            rr = _pct(rc, len(df)); K["Return Rate %"] = rr
+            lost = float(r[retm].sum())
+            if lost > 0: _money_kpi(K, "Returned Revenue", lost)
+            if rr > 10: A.append({"type": "Warning", "text": f"Return rate is {rr}% — above the 10% benchmark ({_fmt(lost)} returned)."})
+            if cat:
+                rcat = _countrows(df[retm], cat, 6)
+                if rcat: S["Returns by category"] = rcat
+
+    # ── New vs returning customers ──
+    if custtype:
+        S["Revenue by customer type"] = _sumrows(df, custtype, r, 6)
+        low = df[custtype].astype(str).str.lower()
+        ret_cust = int(low.str.contains("return|repeat|existing|loyal", na=False).sum())
+        if ret_cust:
+            rp = _pct(ret_cust, len(df)); K["Repeat Customer %"] = rp
+            if rp < 30: A.append({"type": "Opportunity", "text": f"Only {rp}% returning customers — retention upside."})
+
+    # ── Ratings ──
+    if rating:
+        rt = _numv(df, rating).dropna()
+        if len(rt):
+            K["Avg Rating"] = round(float(rt.mean()), 1)
+            if float(rt.mean()) < 3.5:
+                A.append({"type": "Warning", "text": f"Avg rating is {round(float(rt.mean()),1)}/5 — customer satisfaction is low."})
+            if cat:
+                try:
+                    g = _numv(df, rating).groupby(df[cat].astype(str)).mean().sort_values()
+                    g = g[~g.index.str.lower().isin(["nan", "none", ""])]
+                    if len(g): S["Lowest-rated categories"] = [{"name": str(k), "rating": round(float(v), 2)} for k, v in g.head(6).items()]
+                except Exception:
+                    pass
+
+    # ── Delivery performance ──
+    if delivery:
+        dd = _numv(df, delivery).dropna()
+        if len(dd):
+            K["Avg Delivery Days"] = round(float(dd.mean()), 1)
+            slow = int((dd > 7).sum())
+            if slow: A.append({"type": "Warning", "text": f"{slow} order(s) took over a week to deliver."})
     return K, S, A
 
 
