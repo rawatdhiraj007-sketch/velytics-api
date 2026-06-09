@@ -2644,6 +2644,93 @@ def scan_footprint(contents: bytes, name: str, df: pd.DataFrame | None = None) -
     return rep
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# IMAGE / PHOTO METADATA — photos secretly carry GPS location, camera, owner,
+# date. Same "find → show → clean" model as spreadsheets, just an EXIF reader.
+# ════════════════════════════════════════════════════════════════════════════
+_IMG_EXT = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp")
+
+def _gps_to_dec(dms, ref):
+    try:
+        d = dms[0][0] / dms[0][1]; m = dms[1][0] / dms[1][1]; s = dms[2][0] / dms[2][1]
+        dec = d + m / 60 + s / 3600
+        r = ref.decode() if isinstance(ref, bytes) else str(ref)
+        return -dec if r in ("S", "W") else dec
+    except Exception:
+        return None
+
+def scan_image(contents: bytes, name: str) -> dict:
+    """Read what a photo secretly reveals — GPS location, camera, owner, date."""
+    rep = {"applicable": True, "kind": "image", "leaked": {}, "maps": "", "risks": [], "pii": {}, "score": 100}
+    try:
+        import piexif
+        ex = piexif.load(contents)
+        g = lambda ifd, tag: ex.get(ifd, {}).get(tag)
+        dec = lambda b: (b.decode(errors="ignore") if isinstance(b, bytes) else str(b)).strip("\x00 ").strip()
+        make = g("0th", piexif.ImageIFD.Make); model = g("0th", piexif.ImageIFD.Model)
+        if make or model: rep["leaked"]["Camera"] = (dec(make or b"") + " " + dec(model or b"")).strip()
+        sw = g("0th", piexif.ImageIFD.Software)
+        if sw: rep["leaked"]["Software"] = dec(sw)
+        art = g("0th", piexif.ImageIFD.Artist)
+        cpy = g("0th", piexif.ImageIFD.Copyright)
+        if art: rep["leaked"]["Author / owner"] = dec(art)
+        if cpy: rep["leaked"]["Copyright"] = dec(cpy)
+        dt = g("Exif", piexif.ExifIFD.DateTimeOriginal) or g("0th", piexif.ImageIFD.DateTime)
+        if dt: rep["leaked"]["Date taken"] = dec(dt)
+        gps = ex.get("GPS", {})
+        if gps.get(piexif.GPSIFD.GPSLatitude):
+            lat = _gps_to_dec(gps[piexif.GPSIFD.GPSLatitude], gps.get(piexif.GPSIFD.GPSLatitudeRef, b"N"))
+            lon = _gps_to_dec(gps[piexif.GPSIFD.GPSLongitude], gps.get(piexif.GPSIFD.GPSLongitudeRef, b"E"))
+            if lat is not None and lon is not None:
+                rep["leaked"]["GPS location"] = f"{lat:.5f}, {lon:.5f}"
+                rep["maps"] = f"https://maps.google.com/?q={lat},{lon}"
+    except Exception:
+        pass
+
+    s, R = 100, rep["risks"]
+    if "GPS location" in rep["leaked"]:
+        s -= 35; R.append({"label": f"📍 GPS location embedded: {rep['leaked']['GPS location']}", "severity": "high",
+                           "detail": "This reveals exactly where the photo was taken — a real safety risk."})
+    if "Author / owner" in rep["leaked"] or "Copyright" in rep["leaked"]:
+        s -= 15; R.append({"label": f"Owner identity: {rep['leaked'].get('Author / owner') or rep['leaked'].get('Copyright')}", "severity": "high",
+                           "detail": "Your name / copyright is stored inside the photo."})
+    if "Camera" in rep["leaked"] or "Software" in rep["leaked"]:
+        s -= 10; R.append({"label": f"Device info: {rep['leaked'].get('Camera','')} {rep['leaked'].get('Software','')}".strip(), "severity": "medium",
+                           "detail": "The exact device and software are recorded."})
+    if "Date taken" in rep["leaked"]:
+        s -= 5; R.append({"label": f"Date/time taken: {rep['leaked']['Date taken']}", "severity": "low",
+                          "detail": "When the photo was captured."})
+    rep["score"] = max(0, min(100, s))
+    if not R:
+        R.append({"label": "No hidden metadata found — this photo is clean", "severity": "ok", "detail": ""})
+    has_loc = "GPS location" in rep["leaked"]; has_id = "Author / owner" in rep["leaked"] or "Copyright" in rep["leaked"]
+    rep["gdpr"] = ({"personal_data": True, "level": "high",
+                    "verdict": "This photo reveals personal data — strip it before posting or sharing.",
+                    "categories": [k for k in ("GPS location", "Author / owner", "Date taken") if k in rep["leaked"]],
+                    "advice": "Download the cleaned photo below — it looks identical but carries no hidden data."}
+                   if (has_loc or has_id) else
+                   {"personal_data": False, "level": "ok" if not rep["leaked"] else "medium",
+                    "verdict": "No location or identity found." if not rep["leaked"] else "Minor device metadata only — low risk.",
+                    "categories": list(rep["leaked"].keys()),
+                    "advice": "You can still strip the remaining metadata below."})
+    return rep
+
+def strip_image(contents: bytes) -> tuple[bytes, str]:
+    """Return a visually-identical copy with ALL metadata removed."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(contents))
+    fmt = (img.format or "JPEG").upper()
+    save_fmt = "JPEG" if fmt in ("JPG", "JPEG") else fmt
+    clean = Image.new(img.mode, img.size)
+    clean.putdata(list(img.getdata()))
+    if save_fmt == "JPEG" and clean.mode in ("RGBA", "P", "LA"):
+        clean = clean.convert("RGB")
+    out = io.BytesIO()
+    clean.save(out, format=save_fmt)
+    out.seek(0)
+    return out.read(), save_fmt
+
+
 # ── API Routes ────────────────────────────────────────────────────────────────
 @app.get("/")
 def root():
@@ -2878,10 +2965,23 @@ async def analyze(
 ):
     # Validate file type
     name = file.filename.lower() if file.filename else ""
-    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json"]):
-        raise HTTPException(400, "Unsupported file. Please upload .xlsx, .csv, or .json")
+    if not any(name.endswith(ext) for ext in [".xlsx", ".csv", ".json", *_IMG_EXT]):
+        raise HTTPException(400, "Unsupported file. Please upload .xlsx, .csv, .json or an image.")
 
     contents = await file.read()
+
+    # ── Image / photo path: scan EXIF footprint only (no dataframe analysis) ──
+    if name.endswith(_IMG_EXT):
+        fp = scan_image(contents, name)
+        return {
+            "file": file.filename, "file_type": "image", "currency": "$",
+            "footprint": fp, "result": {}, "metadata": [], "health": None, "summary": [],
+            "fixes": [], "filter_schema": [], "dimensions": [], "measures": [],
+            "applied_filters": {}, "applied_edits": 0, "raw_blanks": 0, "blanks_mode": "leave",
+            "preview": [], "rows": 0, "total_rows": 0, "columns": 0, "sheets": [], "sheet_used": "",
+            "detected_type": "Image",
+        }
+
     try:
         df, fixes, sheets, sheet_used, currency = _read_and_clean(contents, name, sheet)
         global _CURRENCY
@@ -3222,6 +3322,20 @@ async def scrub(
     machine-detected items (identity/hidden/comments/PII) PLUS the client's own
     manual picks (remove whole columns, blank cells containing chosen words)."""
     name = file.filename.lower() if file.filename else ""
+
+    # ── Image path: strip ALL EXIF/metadata, return a clean photo ──
+    if name.endswith(_IMG_EXT):
+        contents = await file.read()
+        try:
+            clean, fmt = strip_image(contents)
+        except Exception as e:
+            raise HTTPException(500, f"Could not clean image: {str(e)}")
+        ext = "jpg" if fmt == "JPEG" else fmt.lower()
+        base = (file.filename or "photo").rsplit(".", 1)[0]
+        media = "image/jpeg" if fmt == "JPEG" else f"image/{ext}"
+        return StreamingResponse(io.BytesIO(clean), media_type=media,
+            headers={"Content-Disposition": f'attachment; filename="{base}_cleaned.{ext}"'})
+
     if not name.endswith(".xlsx"):
         raise HTTPException(400, "Footprint cleaning is for Excel .xlsx files.")
     contents = await file.read()
