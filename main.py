@@ -2697,6 +2697,43 @@ def scan_image(contents: bytes, name: str) -> dict:
             if lat is not None and lon is not None:
                 rep["leaked"]["GPS location"] = f"{lat:.5f}, {lon:.5f}"
                 rep["maps"] = f"https://maps.google.com/?q={lat},{lon}"
+
+        # ── Advanced details (beyond what a phone shows) ──
+        det = {}
+        rat = lambda v: round(float(v), 2)
+        try:
+            if sub.get(42036): det["Lens"] = txt(sub.get(42036))
+            bsn = sub.get(42033) or exif.get(42033)
+            if bsn: det["Camera serial no."] = txt(bsn)
+            if sub.get(42037): det["Lens serial no."] = txt(sub.get(42037))
+            if sub.get(33437): det["Aperture"] = f"f/{rat(sub.get(33437))}"
+            iso = sub.get(34855)
+            if iso: det["ISO"] = int(iso[0]) if isinstance(iso, (tuple, list)) else int(iso)
+            exp = sub.get(33434)
+            if exp:
+                ev = float(exp); det["Shutter"] = (f"1/{round(1/ev)}s" if 0 < ev < 1 else f"{rat(exp)}s")
+            if sub.get(37386): det["Focal length"] = f"{rat(sub.get(37386))}mm"
+            fl = sub.get(37385)
+            if fl is not None: det["Flash"] = "On" if (int(fl) & 1) else "Off"
+            if gps:
+                alt = gps.get(6)
+                if alt is not None:
+                    det["Altitude"] = f"{round(float(alt))} m" + (" below sea level" if gps.get(5) in (1, b"\x01") else "")
+                d = gps.get(17)
+                if d is not None:
+                    dv = float(d); dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+                    det["Facing"] = f"{dirs[int((dv + 22.5) % 360 // 45)]} ({round(dv)}°)"
+        except Exception:
+            pass
+        rep["details"] = det
+        # embedded thumbnail — often the ORIGINAL before crop/edit (advanced leak)
+        try:
+            import piexif, base64
+            pex = piexif.load(contents)
+            if pex.get("thumbnail"):
+                rep["thumbnail"] = "data:image/jpeg;base64," + base64.b64encode(pex["thumbnail"]).decode()
+        except Exception:
+            pass
     except Exception:
         rep["readable"] = False
 
@@ -2713,8 +2750,15 @@ def scan_image(contents: bytes, name: str) -> dict:
     if "Date taken" in rep["leaked"]:
         s -= 5; R.append({"label": f"Date/time taken: {rep['leaked']['Date taken']}", "severity": "low",
                           "cat": "date", "detail": "When the photo was captured."})
+    _det = rep.get("details") or {}
+    if _det.get("Camera serial no.") or _det.get("Lens serial no."):
+        s -= 15; R.append({"label": f"Device serial number: {_det.get('Camera serial no.') or _det.get('Lens serial no.')}", "severity": "high",
+                           "cat": "camera", "detail": "A serial number uniquely fingerprints your exact device across EVERY photo you take."})
+    if rep.get("thumbnail"):
+        s -= 15; R.append({"label": "Hidden thumbnail of the original embedded", "severity": "high",
+                           "cat": "thumbnail", "detail": "A cropped/edited photo can still secretly contain the full original image as a thumbnail."})
     rep["score"] = max(0, min(100, s))
-    rep["categories_present"] = sorted({r.get("cat") for r in R if r.get("cat")})
+    rep["categories_present"] = sorted({r.get("cat") for r in R if r.get("cat") and r.get("cat") != "thumbnail"})
     if not R:
         msg = ("No hidden metadata found — this photo is clean (apps like WhatsApp/Instagram strip it on send)."
                if rep["readable"] else "Couldn't read this image format — try a JPG/PNG/HEIC original.")
@@ -2729,6 +2773,16 @@ def scan_image(contents: bytes, name: str) -> dict:
                     "verdict": "No location or identity found." if not rep["leaked"] else "Minor device metadata only — low risk.",
                     "categories": list(rep["leaked"].keys()),
                     "advice": "You can still strip the remaining metadata below."})
+
+    # ── "What this reveals about you" narrative ──
+    parts = []
+    if rep["leaked"].get("Camera"): parts.append(f"on a {rep['leaked']['Camera']}")
+    if rep["leaked"].get("Date taken"): parts.append(f"on {rep['leaked']['Date taken']}")
+    if rep["leaked"].get("GPS location"): parts.append(f"at {rep['leaked']['GPS location']}")
+    if _det.get("Facing"): parts.append(f"facing {_det['Facing']}")
+    if _det.get("Altitude"): parts.append(f"{_det['Altitude']} altitude")
+    if parts:
+        rep["story"] = "Anyone with this photo can see it was taken " + ", ".join(parts) + "."
     return rep
 
 def strip_image(contents: bytes, name: str = "", categories=None) -> tuple[bytes, str]:
@@ -2759,6 +2813,12 @@ def strip_image(contents: bytes, name: str = "", categories=None) -> tuple[bytes
             if "date" in cats:
                 ex["Exif"].pop(piexif.ExifIFD.DateTimeOriginal, None)
                 ex["0th"].pop(piexif.ImageIFD.DateTime, None)
+            # always drop the embedded thumbnail (it can be the uncropped original)
+            ex["1st"] = {}; ex["thumbnail"] = None
+            # also drop serial numbers when removing camera/device info
+            if "camera" in cats:
+                for t in (0xA431, 0xA435):  # BodySerialNumber, LensSerialNumber
+                    ex["Exif"].pop(t, None)
             nb = piexif.dump(ex)
             out = io.BytesIO(); piexif.insert(nb, contents, out); out.seek(0)
             return out.read(), "JPEG"
