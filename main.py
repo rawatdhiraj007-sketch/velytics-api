@@ -1037,12 +1037,16 @@ def analyze_auto(df: pd.DataFrame, profile: list[dict],
                                        f"({top['pct']}% of {primary})."})
         except Exception:
             pass
-    worst = max(profile, key=lambda p: p["missing"], default=None)
-    if worst and worst["missing"] > 0:
-        pct = round(worst["missing"] / max(len(df), 1) * 100)
-        if pct >= 10:
-            alerts.append({"type": "Warning",
-                           "text": f"Column '{worst['column']}' is {pct}% blank — results for it may be partial."})
+    # Blank-% must be measured against the SAME rows we're reporting on, and a
+    # column can never be more than 100% blank (guards tiny post-clean sheets).
+    if len(df) > 0:
+        blanks = [(c, int(df[c].isna().sum())) for c in df.columns]
+        wc = max(blanks, key=lambda x: x[1], default=None)
+        if wc and wc[1] > 0:
+            pct = min(100, round(wc[1] / len(df) * 100))
+            if pct >= 10:
+                alerts.append({"type": "Warning",
+                               "text": f"Column '{wc[0]}' is {pct}% blank — results for it may be partial."})
     if not alerts:
         alerts.append({"type": "Info", "text": f"Analysed {len(df)} rows across {len(df.columns)} columns."})
     result["alerts"] = alerts
@@ -3413,18 +3417,27 @@ def _open_excel(contents: bytes) -> pd.ExcelFile:
 
 def _pick_sheet(xls: pd.ExcelFile, requested: str = "") -> str:
     """Choose which sheet to analyse. Honours an explicit request, else picks the
-    first sheet that actually holds a table (≥2 non-blank rows)."""
+    sheet with the MOST real data — so a small 'Summary'/'Cover' sheet never wins
+    over the actual data sheet in a multi-sheet workbook."""
     names = xls.sheet_names
     if requested and requested in names:
         return requested
+    NON_DATA = ("summary", "cover", "index", "readme", "about", "instruction",
+                "notes", "toc", "legend", "dashboard", "contents", "intro")
+    best, best_score = names[0], -1.0
     for sh in names:
         try:
-            probe = xls.parse(sheet_name=sh, header=None, nrows=30)
+            probe = xls.parse(sheet_name=sh, header=None, nrows=300)
         except Exception:
             continue
-        if probe.dropna(how="all").shape[0] >= 2:
-            return sh
-    return names[0]
+        rows = int(probe.dropna(how="all").shape[0])          # real (non-blank) rows
+        cells = int(probe.notna().sum().sum())                # real (non-blank) cells
+        score = rows * 100.0 + cells                          # data-richness
+        if any(w in str(sh).strip().lower() for w in NON_DATA):
+            score /= 4.0                                       # de-prioritise obvious non-data tabs
+        if score > best_score:
+            best, best_score = sh, score
+    return best
 
 
 def _read_and_clean(contents: bytes, name: str, sheet: str = ""):
